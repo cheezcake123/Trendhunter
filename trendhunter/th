@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# TrendHunter 관리 명령 — install.sh 가 경로를 채워 /usr/local/bin/th 로 설치합니다.
+APP="__APP_DIR__"
+DATA="__DATA_DIR__"
+SVC=trendhunter
+
+case "${1:-help}" in
+  status)
+    echo "서비스 상태: $(systemctl is-active $SVC)"
+    tail -n 15 "$DATA/bot.log" 2>/dev/null ;;
+  logs)
+    tail -n "${2:-80}" "$DATA/bot.log" ;;
+  follow)
+    tail -f "$DATA/bot.log" ;;
+  start|stop|restart)
+    sudo systemctl "$1" "$SVC" && echo "$1 완료" ;;
+  selftest)
+    python3 "$APP/selftest.py" --data "$DATA" "${@:2}" ;;
+  backtest)
+    python3 "$APP/backtest_mix.py" --data "$DATA" "${@:2}" ;;
+  backtest-futures)
+    python3 "$APP/backtest.py" --data "$DATA" "${@:2}" ;;
+  update)
+    python3 "$APP/updater.py" --data "$DATA" --app "$APP" "${@:2}" && sudo systemctl restart "$SVC" ;;
+  rollback)
+    python3 "$APP/updater.py" --data "$DATA" --app "$APP" --rollback && sudo systemctl restart "$SVC" ;;
+  keys)
+    TH_RECONFIGURE=1 TH_DATA_DIR="$DATA" bash "$APP/install.sh" ;;
+  ip)
+    python3 "$APP/setup_helper.py" public-ip ;;
+  version)
+    python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['version'])" "$APP/config.json" ;;
+  *)
+    cat <<'EOF'
+th status      서비스 상태 + 최근 로그 15줄
+th logs [N]    최근 로그 N줄 (기본 80)
+th follow      로그 실시간 보기 (끝내기: Ctrl+C)
+th restart     봇 재시작        th stop / th start
+th selftest    바이낸스 점검     th selftest --live (소액 실주문 왕복)
+th backtest --days 730        서버에서 현물+선물 합산 백테스트 (선물만: th backtest-futures)
+th update      저장된 주소에서 최신 코드 받아 설치
+th rollback    직전 버전으로 복구
+th keys        API 키·텔레그램 다시 입력
+th ip          서버 공인 IP 보기
+EOF
+    ;;
+esac
