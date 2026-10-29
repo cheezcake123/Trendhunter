@@ -213,6 +213,33 @@ class FailurePaths(unittest.TestCase):
         self.assertEqual(self.fake.positions, {})
         self.assertEqual(store.read_all("journal.jsonl")[-1]["reason"], "SOFT_STOP")
 
+    def test_exit_after_exchange_stop_already_filled(self):
+        tr, tg, store = self.started()
+        tr.enter("AAAUSDT", fake_signal(tr, "AAAUSDT"), tr.broker.equity())
+        pos = tr.positions["AAAUSDT"]
+        # the exchange stop fills first (a fast drop between two loops) ...
+        algo = self.fake.open_algos("AAAUSDT")[0]
+        amt = abs(self.fake.positions["AAAUSDT"]["amt"])
+        self.fake._fill("AAAUSDT", "SELL", amt, pos["stop"], int(self.clock() * 1000), reduce_only=True)
+        algo["algoStatus"] = "FINISHED"
+        # ... and right after that the bot wants out too (time stop, reverse signal, /close): -2022 from Binance
+        self.assertTrue(tr.exit_position("AAAUSDT", "TIME"))
+        self.assertNotIn("AAAUSDT", tr.positions)
+        self.assertFalse(any("청산 주문 실패" in t for t in tg.texts()), "a filled stop is not an emergency")
+        self.assertEqual(store.read_all("journal.jsonl")[-1]["reason"], "STOP")
+
+    def test_reduce_only_rejection_with_position_still_open_alerts(self):
+        tr, tg, store = self.started()
+        tr.enter("AAAUSDT", fake_signal(tr, "AAAUSDT"), tr.broker.equity())
+
+        def reject(*a, **k):
+            raise BinanceError(400, -2022, "ReduceOnly Order is rejected.", "/fapi/v1/order")
+
+        tr.broker.market = reject
+        self.assertFalse(tr.exit_position("AAAUSDT", "MANUAL"))
+        self.assertIn("AAAUSDT", tr.positions)
+        self.assertTrue(any("청산 주문 실패" in t for t in tg.texts()))
+
     def test_adopts_external_position(self):
         self.fake._fill("AAAUSDT", "BUY", 0.5, self.fake.price("AAAUSDT"), int(START * 1000))
         tr, tg, _ = self.started()
@@ -252,7 +279,8 @@ class FailurePaths(unittest.TestCase):
         tr.refresh_data()
         for text in ["/help", "/status", "/pnl", "/scan", "/log", "/log 5", "/settings", "/risk", "/risk 2.5",
                      "/set max_open_positions 2", "/set symbols aaa,bbb", "/set symbols zzz", "/set risk_per_trade_pct 9",
-                     "/pause", "/resume", "/version", "/nonsense", "📊 상태", "hello", "/selftest", "/rebase"]:
+                     "/pause", "/resume", "/version", "/nonsense", "📊 상태", "hello", "/selftest", "/rebase",
+                     "/report", "/report 이번달", "/set monthly_report false"]:
             n = len(tg.sent)
             tr.handle_update({"message": {"chat": {"id": 42}, "text": text}})
             self.assertGreater(len(tg.sent), n, f"no reply to {text}")
@@ -308,6 +336,86 @@ class PaperScenario(unittest.TestCase):
             self.assertGreaterEqual(len(journal), 1)
             self.assertAlmostEqual(tr.broker.st["balance"] - b0, sum(j["pnl"] for j in journal), delta=0.01)
             self.assertEqual(fake.trades, [])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class MonthlyReport(unittest.TestCase):
+    """v2.1: one report per month (UTC month = the bot's 09:00 KST trading day), with a futures health check."""
+
+    @staticmethod
+    def trade(pnl, ts, r=None):
+        return {"ts": ts, "mode": "paper", "sym": "AAAUSDT", "side": S.LONG, "pnl": pnl, "fee": 0.05,
+                "funding": -0.01, "r": pnl if r is None else r, "reason": "STOP"}
+
+    def test_text_has_total_btc_and_futures_numbers(self):
+        import report as RP
+        start, end, label = RP.prev_month(RP.month_start(1_762_000_000))  # 2025-10
+        self.assertEqual(label, "2025년 10월")
+        hist = [["2025-09-30", 50.0, 40.0], ["2025-10-01", 50.0, 50.0], ["2025-10-15", 52.0, 50.0],
+                ["2025-11-01", 55.0, 55.0], ["2025-11-02", 99.0, 99.0]]
+        day = 86_400_000
+        btc = [[int(start * 1000), "100", "0", "0", "0"], [int(end * 1000), "105", "0", "0", "0"],
+               [int(end * 1000) - day, "104", "0", "0", "0"]]
+        trades = [self.trade(4.0, start + 100), self.trade(-1.0, start + 200)]
+        text = RP.monthly_text(label, "모의(PAPER)", hist, start, end, trades, trades, 3, btc)
+        self.assertIn("2025년 10월", text)
+        self.assertIn("$100.00 → $110.00 (+10.0%)", text)
+        self.assertIn("BTC 보유: +5.0%", text)
+        self.assertIn("거래 2건 · 승률 50%", text)
+        self.assertIn("수익팩터 4.00", text)
+        self.assertIn("리밸런싱 체결 3건", text)
+        self.assertNotIn("🩺", text)  # fewer than 10 trades: no verdict
+        short = RP.monthly_text(label, "모의(PAPER)", hist[3:4], start, end, [], [], 0)
+        self.assertIn("기록이 아직 부족", short)
+        self.assertIn("청산된 거래 없음", short)
+
+    def test_health_line_needs_enough_trades(self):
+        import report as RP
+        losing = [self.trade(-1.0, i) for i in range(16)] + [self.trade(2.0, 100 + i) for i in range(6)]
+        self.assertIn("/preset 안정", RP.health_line(losing))           # 22 trades, PF 0.75
+        self.assertIn("표본이 적어", RP.health_line(losing[3:]))        # 19 trades, PF 0.92: too early to judge
+        winning = [self.trade(1.0, i) for i in range(8)] + [self.trade(-1.0, 50 + i) for i in range(4)]
+        self.assertIn("정상 범위", RP.health_line(winning))
+        self.assertIsNone(RP.health_line(winning[:5]))
+
+    def test_sent_once_a_month_after_the_daily_close(self):
+        import report as RP
+        tmp = tempfile.mkdtemp()
+        try:
+            clock = SimClock(START)
+            fake = FakeExchange(clock, direction=1, test_days=1, history_days=60)
+            tr, tg, store = make_trader(fake, clock, tmp, mode="paper")
+            tr.monthly(START)  # first run after the update: remember the month, send nothing
+            self.assertEqual(tg.texts(), [])
+            nxt = RP.month_start(START + 32 * 86400)
+            tr.monthly(nxt + 300)  # 09:05 KST: the spot run has not happened yet
+            self.assertEqual(tg.texts(), [])
+            tr.monthly(nxt + 900)
+            tr.monthly(nxt + 5000)
+            reports = [t for t in tg.texts() if t.startswith("📅 월간 리포트")]
+            self.assertEqual(len(reports), 1)
+            self.assertIn(RP.month_label(START), reports[0])
+            tr.cfg["monthly_report"] = False
+            tr.monthly(RP.month_start(nxt + 32 * 86400) + 900)
+            self.assertEqual(len([t for t in tg.texts() if t.startswith("📅")]), 1)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_daily_total_is_recorded_without_spot_sleeve(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            clock = SimClock(START)
+            fake = FakeExchange(clock, direction=1, test_days=3, history_days=260)
+            tr, tg, store = make_trader(fake, clock, tmp, mode="paper")  # spot sleeve off
+            tr.startup()
+            for _ in range(int(2.2 * 86400 / 600)):
+                clock.advance(600)
+                tr.step()
+            days = [h[0] for h in tr.state["hist"]]
+            self.assertGreaterEqual(len(days), 3)
+            self.assertEqual(len(days), len(set(days)), "one row per UTC day")
+            self.assertTrue(all(h[2] > 0 and h[1] == 0 for h in tr.state["hist"]))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

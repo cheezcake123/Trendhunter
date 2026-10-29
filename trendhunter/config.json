@@ -1,6 +1,6 @@
 {
   "bot_name": "TrendHunter",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "spot_enabled": true,
   "alloc_spot_pct": 50,
   "alloc_band_pct": 10,
@@ -55,7 +55,7 @@
     120,
     200
   ],
-  "donchian_len": 20,
+  "donchian_len": 40,
   "atr_len": 14,
   "adx_len": 14,
   "adx_min": 20,
@@ -67,7 +67,7 @@
   "stop_atr_mult": 2.0,
   "min_stop_pct": 0.8,
   "max_stop_pct": 10.0,
-  "trail_atr_mult": 6.0,
+  "trail_atr_mult": 5.0,
   "trail_min_step_atr": 0.25,
   "breakeven_at_r": 1.5,
   "breakeven_lock_r": 0.2,
@@ -92,5 +92,6 @@
   "loop_seconds": 20,
   "brief_morning_kst": "08:00",
   "brief_evening_kst": "21:15",
+  "monthly_report": true,
   "update_url": ""
 }

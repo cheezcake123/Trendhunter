@@ -113,6 +113,7 @@ class FakeExchange:
         self.spot_status = {}            # symbol -> status override in spot exchangeInfo (e.g. "BREAK")
         self.drop_order_response = 0    # futures: execute the order, then answer 503
         self.hide_order_lookups = 0     # futures: the next N lookups say "does not exist"
+        self.funding_rate = None        # futures: set a rate (e.g. 0.0001) to serve /fapi/v1/fundingRate history
 
     # ------------------------------------------------------------ prices
     def _minute(self, ts_ms):
@@ -428,6 +429,19 @@ class FakeExchange:
             return 200, {"symbols": syms}
         if path == "/fapi/v1/klines":
             return 200, self.klines(P["symbol"], P["interval"], P.get("limit", 500), P.get("startTime"), P.get("endTime"))
+        if path == "/fapi/v1/fundingRate":
+            if self.funding_rate is None:
+                return 404, {"code": -5000, "msg": f"no route {path}"}
+            step = 8 * 3_600_000
+            t = max(int(P.get("startTime", self.path_start)), self.path_start)
+            t = -(-t // step) * step
+            end = min(int(P.get("endTime", now_ms)), now_ms)
+            rows = []
+            while t <= end and len(rows) < int(P.get("limit", 100)):
+                rows.append({"symbol": P["symbol"], "fundingTime": t, "fundingRate": f"{self.funding_rate}",
+                             "markPrice": f"{self.price(P['symbol'], t)}"})
+                t += step
+            return 200, rows
         if path == "/fapi/v1/premiumIndex":
             return 200, [{"symbol": s, "markPrice": f"{self.price(s)}"} for s in self.symbols]
         if path in ("/fapi/v3/account", "/fapi/v2/account"):

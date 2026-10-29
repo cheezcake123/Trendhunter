@@ -65,6 +65,68 @@ class BacktestTests(unittest.TestCase):
         self.assertAlmostEqual(res["final"] - 100.0, booked, delta=1e-6)
 
 
+class FundingTests(unittest.TestCase):
+    """v2.1: the backtest charges the real funding history (longs pay positive rates) instead of a guess."""
+
+    def run_bt(self, rate, cache_dir=None):
+        clock = SimClock(START)
+        fake = FakeExchange(clock, direction=1, history_days=420, test_days=1)
+        fake.funding_rate = rate
+        api = make_api(fake, clock)
+        cfg = dict(CFG, symbols=list(fake.symbols))
+        data, start = backtest.load_data(api, cfg, 120, cache_dir, int(START * 1000))
+        pre = backtest.precompute(cfg, data)
+        return backtest.simulate(cfg, pre, start, 3.0, 100.0), data, fake
+
+    def test_real_funding_history_is_charged_by_side(self):
+        free, data, _ = self.run_bt(0.0)
+        self.assertEqual(free["funding_mode"], "real")
+        ft, fr = data["BTCUSDT"]["funding"]
+        self.assertTrue(ft and all(b - a == 8 * 3_600_000 for a, b in zip(ft, ft[1:])))
+        self.assertTrue(free["trades"], "the fake uptrend should produce long trades")
+        paid, _, _ = self.run_bt(0.002)  # 0.2% every 8h: longs pay a lot
+        self.assertLess(paid["final"], free["final"] - 1e-6)
+        got, _, _ = self.run_bt(-0.002)  # negative funding: longs are paid
+        self.assertGreater(got["final"], free["final"] + 1e-6)
+        for res in (free, paid, got):  # cash accounting still adds up trade by trade
+            self.assertAlmostEqual(res["final"] - 100.0, sum(t["pnl"] for t in res["trades"]), delta=1e-6)
+
+    def test_missing_funding_endpoint_falls_back_to_flat(self):
+        res, data, _ = self.run_bt(None)  # the fake answers 404
+        self.assertEqual(res["funding_mode"], "flat")
+        self.assertIsNone(data["BTCUSDT"]["funding"])
+        text = backtest.format_report(CFG, 120, 0, int(START * 1000), {3.0: res}, 3.0, 3)
+        self.assertIn("펀딩비(추정치)", text)
+
+    def test_funding_history_cache_is_topped_up(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            _, _, fake = self.run_bt(0.0001, cache_dir=tmp)
+            first = len([c for c in fake.calls if c[1] == "/fapi/v1/fundingRate"])
+            self.assertTrue(os.path.exists(os.path.join(tmp, "BTCUSDT_funding.json")))
+            res, _, fake2 = self.run_bt(0.0001, cache_dir=tmp)
+            again = len([c for c in fake2.calls if c[1] == "/fapi/v1/fundingRate"])
+            self.assertGreater(first, 0)
+            self.assertLessEqual(again, len(fake2.symbols))  # one small top-up request per symbol
+            self.assertEqual(res["funding_mode"], "real")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class ConfigCheckTests(unittest.TestCase):
+    def test_check_rejects_a_bad_monthly_report_value(self):
+        import bot
+        tmp = tempfile.mkdtemp()
+        try:
+            self.assertEqual(bot.check(tmp), 0)
+            with open(os.path.join(tmp, "settings.json"), "w", encoding="utf-8") as fh:
+                json.dump({"monthly_report": "yes"}, fh)
+            with self.assertRaises(SystemExit):
+                bot.check(tmp)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 class UpdaterTests(unittest.TestCase):
     def test_update_and_rollback(self):
         tmp = tempfile.mkdtemp()

@@ -19,7 +19,8 @@ import zipfile
 
 REQUIRED = ["bot.py", "strategy.py", "risk.py", "brokers.py", "binance_api.py", "telegram_client.py",
             "store.py", "indicators.py", "backtest.py", "selftest.py", "updater.py", "setup_helper.py",
-            "config.json", "install.sh", "th", "spot.py", "spot_strategy.py", "binance_spot.py", "backtest_mix.py"]
+            "config.json", "install.sh", "th", "spot.py", "spot_strategy.py", "binance_spot.py", "backtest_mix.py",
+            "report.py"]
 SKIP_NAMES = {"__pycache__", ".git", ".DS_Store"}
 
 

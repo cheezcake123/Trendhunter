@@ -127,6 +127,11 @@ class BinanceFutures:
             "symbol": symbol, "interval": interval, "limit": int(limit),
             "startTime": start_time, "endTime": end_time})
 
+    def funding_rates(self, symbol, start_time=None, end_time=None, limit=1000):
+        """Funding history (public): [{symbol, fundingTime, fundingRate, ...}], oldest first."""
+        return self._request("GET", "/fapi/v1/fundingRate", {
+            "symbol": symbol, "startTime": start_time, "endTime": end_time, "limit": int(limit)})
+
     def mark_prices(self, symbols=None):
         """Mark prices. For a handful of symbols ask one by one (a few hundred bytes instead of the whole
         ~100 KB market list every loop); otherwise fetch the full list."""
