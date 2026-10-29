@@ -27,6 +27,7 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 if APP_DIR not in sys.path:
     sys.path.insert(0, APP_DIR)
 
+import report as RP  # noqa: E402
 import risk as R  # noqa: E402
 import strategy as S  # noqa: E402
 from binance_api import BinanceError, BinanceFutures, NetworkError, parse_filters  # noqa: E402
@@ -58,14 +59,14 @@ KEYBOARD = [["📊 상태", "💰 손익"], ["🪙 현물", "🔎 스캔"], ["�
 LABEL_CMD = {"📊 상태": "status", "💰 손익": "pnl", "🔎 스캔": "scan", "📜 기록": "log", "🪙 현물": "spot",
              "⚖️ 배분": "alloc", "⏸ 정지": "pause", "▶️ 재개": "resume", "❓ 도움말": "help"}
 PRESETS = {  # name: (spot %, futures risk per trade %, spot vol target) — see the research report
-    "안정": (70, 3.0, 0.6),
+    "안정": (70, 2.0, 0.6),
     "기본": (50, 3.0, 0.6),
     "공격": (40, 4.0, 0.6),
 }
-PRESET_NOTE = {
-    "안정": "과거 최대낙폭 약 -34%, 2022~26 검증구간 연 33%",
-    "기본": "과거 최대낙폭 약 -39%, 2022~26 검증구간 연 36%",
-    "공격": "과거 최대낙폭 약 -49%, 2022~26 검증구간 연 42%",
+PRESET_NOTE = {  # v2.1 rules on Binance data 2020-01 ~ 2026-10, real funding rates
+    "안정": "과거 최대낙폭 약 -28%, 2024~26 연 31%",
+    "기본": "과거 최대낙폭 약 -35%, 2024~26 연 39%",
+    "공격": "과거 최대낙폭 약 -44%, 2024~26 연 48%",
 }
 COMMANDS = [
     ("status", "현재 상태·보유 포지션"), ("pnl", "손익 성과"), ("spot", "현물 보유·목표 비중"),
@@ -75,7 +76,7 @@ COMMANDS = [
     ("settings", "설정 보기"), ("set", "설정 변경: /set 키 값"), ("backtest", "백테스트: /backtest 365"),
     ("selftest", "계정·API 점검"), ("live", "실전 모드 전환"), ("paper", "모의 모드 전환"),
     ("update", "코드 업데이트"), ("rollback", "직전 버전 복구"), ("restart", "봇 재시작"),
-    ("rebase", "자본 기준점 재설정"), ("export", "거래기록 CSV 받기"), ("help", "도움말"),
+    ("rebase", "자본 기준점 재설정"), ("export", "거래기록 CSV 받기"), ("report", "월간 리포트"), ("help", "도움말"),
 ]
 SETTABLE = {
     "risk_per_trade_pct": (float, 0.25, 5.0),
@@ -103,6 +104,7 @@ SETTABLE = {
     "update_url": (str, None, None),
     "brief_morning_kst": ("hhmm", None, None),
     "brief_evening_kst": ("hhmm", None, None),
+    "monthly_report": (bool, None, None),
 }
 
 
@@ -371,7 +373,10 @@ class Trader:
             self.state["last_candle"] = last_closed_ms
             self.on_candle(now, allow_entries=(now - cur_open) <= 600)
         self.spot_step(now)
+        if self.state.get("hist_day") != utc_day(now):
+            self.record_daily(now)  # one total-equity row per UTC day, with or without the spot sleeve
         self.briefs(now)
+        self.monthly(now)
         self.save()
 
     def track_equity(self, now):
@@ -649,9 +654,14 @@ class Trader:
             self.send("\n".join(lines), silent=True)
 
     def record_daily(self, now):
-        sv = self.spot.value()["equity"] if self.spot_ready else 0.0
+        try:
+            sv = self.spot.value()["equity"] if self.spot_ready else 0.0
+        except (BinanceError, NetworkError) as e:  # try again on the next step
+            self.log.warning("daily record: %s", e)
+            return
         fv = float(self.state.get("equity") or 0.0)
         day = utc_day(now)
+        self.state["hist_day"] = day
         h = self.state.setdefault("hist", [])
         if h and h[-1][0] == day:
             h[-1] = [day, round(sv, 4), round(fv, 4)]
@@ -931,12 +941,24 @@ class Trader:
         try:
             self.broker.market(sym, close_side, pos["qty"], reduce_only=True, tag="X")
         except (BinanceError, NetworkError) as e:
+            pos.pop("exit_reason", None)
+            if isinstance(e, BinanceError) and e.code == -2022 and self.gone_on_exchange(sym, pos):
+                # the exchange stop (or a close in the app) got there first: book what really happened, no alarm
+                self.finalize(sym, pos)
+                return True
             self.send(f"🚨 {short(sym)} 청산 주문 실패: {e}\n거래소 손절 주문은 유지됩니다. 앱에서 확인해 주세요.")
             self.event("ERROR", where="exit", sym=sym, msg=str(e))
-            pos.pop("exit_reason", None)
             return False
         self.finalize(sym, pos, reason)
         return True
+
+    def gone_on_exchange(self, sym, pos):
+        """True only when the exchange positively shows no position on our side of sym."""
+        try:
+            e = self.broker.positions().get(sym)
+        except (BinanceError, NetworkError):
+            return False
+        return not e or (e["amt"] > 0) != (pos["side"] == S.LONG)
 
     def finalize(self, sym, pos, reason=None):
         reason = reason or pos.get("exit_reason")
@@ -1038,6 +1060,37 @@ class Trader:
                     self.send(self.brief_text(name, now))
                 except Exception as e:
                     self.log.warning("brief failed: %s", e)
+
+    def monthly(self, now):
+        """Once a month, from 09:10 KST on the 1st (after the daily spot run), report the month that just ended."""
+        if not self.cfg.get("monthly_report", True):
+            return
+        key = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m")
+        last = self.state.get("report_month")
+        if last is None:
+            self.state["report_month"] = key  # first run (new install or update): the first report is next month
+            return
+        if last == key or now - RP.month_start(now) < 600:
+            return
+        self.state["report_month"] = key
+        try:
+            start, end, label = RP.prev_month(now)
+            self.send(self.monthly_text(start, end, label))
+        except Exception as e:  # a report must never disturb trading
+            self.log.warning("monthly report failed: %s", e)
+
+    def monthly_text(self, start, end, label):
+        js = self.journal()
+        trades = [t for t in js if start <= t.get("ts", 0) < end]
+        fills = [t for t in self.store.read_all("spot_trades.jsonl")
+                 if t.get("mode") == self.state["mode"] and start <= t.get("ts", 0) < end]
+        try:
+            btc = self.api.klines("BTCUSDT", "1d", limit=45)
+        except (BinanceError, NetworkError) as e:
+            self.log.warning("monthly report BTC prices: %s", e)
+            btc = None
+        return RP.monthly_text(label, self.mode_ko(), self.state.get("hist") or [], start, end, trades, js[-30:],
+                               len(fills), btc)
 
     def worst_case(self):
         tot = 0.0
@@ -1181,6 +1234,7 @@ class Trader:
             "📊 /status 상태·보유 포지션\n💰 /pnl 손익 성과\n🪙 /spot 현물 보유·목표 비중\n"
             "⚖️ /alloc 현물/선물 배분 (/alloc 50 = 현물 50%)\n🎚 /preset 안정·기본·공격 위험 단계\n"
             "🔎 /scan 선물 종목별 신호 상태\n📜 /log 최근 판단 기록\n📁 /export 거래기록 CSV(세금 신고용)\n"
+            "📅 /report 지난달 리포트 (/report 이번달) — 매월 1일 자동 발송\n"
             "⏸ /pause 신규 진입 정지 · ▶️ /resume 재개\n"
             "/close BTC 한 종목 청산 · /closeall 전체 청산\n"
             "/risk 3 — 1회 위험(%) 변경 · /settings 설정 보기 · /set 키 값\n"
@@ -1307,7 +1361,7 @@ class Trader:
         cur = (float(self.cfg.get("alloc_spot_pct", 50)), float(self.cfg["risk_per_trade_pct"]),
                float(self.cfg.get("spot_vol_target", 0.6)))
         if not args or args[0] not in PRESETS:
-            lines = ["🎚 위험 단계 (백테스트 2018~2026, 수수료·펀딩 포함)"]
+            lines = ["🎚 위험 단계 (백테스트 2020~2026, 수수료·실제 펀딩비 포함)"]
             for k, (sp, rk, vt) in PRESETS.items():
                 mark = " ← 현재" if cur == (sp, rk, vt) else ""
                 lines.append(f"{k}: 현물 {sp}% / 선물 {100 - sp}% · 선물 1회 위험 {rk:g}% — {PRESET_NOTE[k]}{mark}")
@@ -1375,6 +1429,14 @@ class Trader:
             if self.tg and hasattr(self.tg, "send_document") else None
         if not ok:
             self.send("⚠️ 파일 전송에 실패했습니다. 잠시 뒤 다시 시도하세요.")
+
+    def cmd_report(self, args):
+        now = self.now()
+        if args and args[0] in ("이번달", "this", "now"):
+            start, end, label = RP.month_start(now), now, RP.month_label(now) + " (지금까지)"
+        else:
+            start, end, label = RP.prev_month(now)
+        self.send(self.monthly_text(start, end, label))
 
     def cmd_scan(self, args):
         lines = ["🔎 스캔 (마지막 마감봉 기준)"]
@@ -1482,7 +1544,7 @@ class Trader:
                 "symbols", "signal_tf", "trend_tf", "allow_long", "allow_short", "risk_per_trade_pct", "max_leverage", "max_open_positions", "max_same_direction",
                 "max_entries_per_day", "daily_loss_limit_pct", "loss_streak_limit", "loss_streak_pause_hours",
                 "cooldown_after_loss_hours", "equity_floor_pct", "time_stop_hours", "adx_min",
-                "brief_morning_kst", "brief_evening_kst", "update_url"]
+                "brief_morning_kst", "brief_evening_kst", "monthly_report", "update_url"]
         lines = ["⚙️ 설정 (변경: /set 키 값)"]
         for k in keys:
             v = self.cfg.get(k)
@@ -1642,6 +1704,7 @@ class Trader:
         st.update(last_day=None, net_in=None, targets={}, diag={}, fails=0, retry_at=0.0, last_trades=[])
         self.state["total"] = {}
         self.state["hist"] = []
+        self.state["hist_day"] = None
         self.state["force_alloc"] = True
         self.state["pending_transfer"] = None
         try:
@@ -1916,6 +1979,7 @@ def check(data_dir):
     """Used by the updater: imports everything and validates the config."""
     import backtest  # noqa: F401
     import backtest_mix  # noqa: F401
+    import report  # noqa: F401
     import selftest  # noqa: F401
     import spot  # noqa: F401
     import spot_strategy  # noqa: F401
@@ -1923,11 +1987,13 @@ def check(data_dir):
     store = Store(data_dir)
     cfg = load_config(APP_DIR, store)
     for key in ("symbols", "signal_tf", "trend_tf", "risk_per_trade_pct", "ma_periods",
-                "spot_candidates", "spot_lookbacks", "spot_vol_target", "alloc_spot_pct"):
+                "spot_candidates", "spot_lookbacks", "spot_vol_target", "alloc_spot_pct", "monthly_report"):
         if key not in cfg:
             raise SystemExit(f"config missing {key}")
     if not 0 <= float(cfg["alloc_spot_pct"]) <= 100:
         raise SystemExit("bad alloc_spot_pct")
+    if not isinstance(cfg["monthly_report"], bool):
+        raise SystemExit("bad monthly_report (true/false)")
     if cfg["signal_tf"] not in TF_SECONDS or cfg["trend_tf"] not in TF_SECONDS:
         raise SystemExit("bad timeframe")
     print(f"OK {cfg['bot_name']} {cfg['version']}")

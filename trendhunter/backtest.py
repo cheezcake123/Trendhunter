@@ -2,11 +2,12 @@
 """Backtester that reuses the live rules (strategy.py + risk.py).
 
 python3 backtest.py --data ~/trendhunter-data --days 365 [--risks 1,2,3,5] [--csv trades.csv]
-Downloads Binance USD-M futures klines (public endpoint, no key needed) and caches them.
+Downloads Binance USD-M futures klines and funding-rate history (public endpoints, no key needed) and caches them.
 """
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 import math
 import os
@@ -23,7 +24,8 @@ import strategy as S  # noqa: E402
 from binance_api import BinanceError, BinanceFutures, NetworkError, parse_filters  # noqa: E402
 
 TF_MS = {"15m": 900_000, "30m": 1_800_000, "1h": 3_600_000, "2h": 7_200_000, "4h": 14_400_000,
-         "6h": 21_600_000, "12h": 43_200_000, "1d": 86_400_000}
+         "6h": 21_600_000, "8h": 28_800_000, "12h": 43_200_000, "1d": 86_400_000}
+FUNDING_KO = {"real": "실제 펀딩비", "mixed": "펀딩비(일부 종목은 추정치)", "flat": "펀딩비(추정치)"}
 KST = timezone(timedelta(hours=9))
 
 
@@ -67,6 +69,44 @@ def fetch_klines(api, sym, tf, start_ms, end_ms, cache_dir=None, pause=0.15):
     return closed
 
 
+def fetch_funding(api, sym, start_ms, end_ms, cache_dir=None, pause=0.15):
+    """Funding-rate history -> (times_ms, rates), oldest first. Cached and topped up like the klines."""
+    path = None
+    cached = []
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+        path = os.path.join(cache_dir, f"{sym}_funding.json")
+        if os.path.exists(path):
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    cached = json.load(fh)
+            except Exception:
+                cached = []
+    rows = [(int(t), float(r)) for t, r in cached if int(t) >= start_ms]
+    if not rows or rows[0][0] > start_ms + 86_400_000:
+        rows, cursor = [], start_ms
+    else:
+        cursor = rows[-1][0] + 1
+    while cursor < end_ms:
+        batch = api.funding_rates(sym, start_time=cursor, end_time=end_ms, limit=1000)
+        if not batch:
+            break
+        rows.extend((int(b["fundingTime"]), float(b["fundingRate"])) for b in batch)
+        cursor = int(batch[-1]["fundingTime"]) + 1
+        if len(batch) < 1000:
+            break
+        if pause:
+            time.sleep(pause)
+    uniq = dict(rows)
+    out = [(t, uniq[t]) for t in sorted(uniq) if t <= end_ms]
+    if path:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(out, fh)
+        os.replace(tmp, path)
+    return [t for t, _ in out], [r for _, r in out]
+
+
 def load_data(api, cfg, days, cache_dir=None, now_ms=None, log=None):
     now_ms = now_ms or int(time.time() * 1000)
     start = now_ms - days * 86_400_000
@@ -79,10 +119,17 @@ def load_data(api, cfg, days, cache_dir=None, now_ms=None, log=None):
             if log:
                 log.warning("backtest data %s: %s", sym, e)
             continue
+        try:
+            fund = fetch_funding(api, sym, start, now_ms, cache_dir)
+            fund = fund if fund[0] else None
+        except (BinanceError, NetworkError, KeyError, TypeError, ValueError) as e:
+            fund = None  # the simulation falls back to a flat, conservative funding charge
+            if log:
+                log.warning("backtest funding %s: %s", sym, e)
         c1 = S.candles_from_klines(r1, now_ms)
         c4 = S.candles_from_klines(r4, now_ms)
         if len(c1["c"]) > 300 and len(c4["c"]) > max(cfg["ma_periods"]) + 10:
-            data[sym] = {"c1": c1, "c4": c4}
+            data[sym] = {"c1": c1, "c4": c4, "funding": fund}
     return data, start
 
 
@@ -92,7 +139,8 @@ def precompute(cfg, data):
         ind = S.prepare_1h(d["c1"], cfg)
         r4 = S.prepare_4h(d["c4"], cfg)
         sigs = [S.evaluate(ind, i, S.regime_at(r4, ind["tc"][i]), cfg) for i in range(len(ind["c"]))]
-        pre[sym] = {"ind": ind, "sigs": sigs, "idx": {t: i for i, t in enumerate(ind["t"])}}
+        pre[sym] = {"ind": ind, "sigs": sigs, "idx": {t: i for i, t in enumerate(ind["t"])},
+                    "funding": d.get("funding")}
     return pre
 
 
@@ -104,7 +152,8 @@ def simulate(cfg, pre, start_ms, risk_pct=None, start_equity=100.0, filters=None
 
     Entries fill at the signal candle's close (+slippage); stops are checked against the next
     candles' high/low (gap -> fill at the open); trailing stops move at each close.
-    Funding is charged to both sides (conservative)."""
+    Funding uses the real funding-rate history when the data has it (longs pay positive rates, shorts
+    receive them); otherwise funding_bps_8h is charged to both sides (conservative)."""
     p = dict(cfg)
     if risk_pct is not None:
         p["risk_per_trade_pct"] = float(risk_pct)
@@ -157,7 +206,12 @@ def simulate(cfg, pre, start_ms, risk_pct=None, start_equity=100.0, filters=None
             if q["side"] == S.SHORT and h >= q["stop"]:
                 close(sym, max(o, q["stop"]) * (1 + sslip), "TRAIL" if locked else "STOP", t_close)
                 continue
-            fc = q["qty"] * c * fund_bar
+            if s.get("funding"):
+                ft, fr = s["funding"]
+                rate = sum(fr[bisect.bisect_right(ft, t):bisect.bisect_right(ft, t_close)])
+                fc = q["qty"] * c * rate * (1 if q["side"] == S.LONG else -1)
+            else:
+                fc = q["qty"] * c * fund_bar
             cash -= fc
             q["funding"] += fc
             q["extreme"] = max(q["extreme"], h) if q["side"] == S.LONG else min(q["extreme"], lo)
@@ -216,8 +270,10 @@ def simulate(cfg, pre, start_ms, risk_pct=None, start_equity=100.0, filters=None
     for sym in list(pos):
         close(sym, last_close.get(sym, pos[sym]["entry"]), "END", curve[-1][0] if curve else start_ms)
     final = cash
+    n_real = sum(1 for s in pre.values() if s.get("funding"))
+    mode = "real" if pre and n_real == len(pre) else "mixed" if n_real else "flat"
     return {"trades": trades, "curve": curve, "final": final, "start": float(start_equity),
-            "max_dd": max_dd * 100.0, "skips": skips, "risk_pct": p["risk_per_trade_pct"]}
+            "max_dd": max_dd * 100.0, "skips": skips, "risk_pct": p["risk_per_trade_pct"], "funding_mode": mode}
 
 
 def metrics(res):
@@ -278,8 +334,9 @@ def format_report(cfg, days, start_ms, end_ms, results, cur_risk, n_syms):
     d0 = datetime.fromtimestamp(start_ms / 1000, KST).strftime("%Y-%m-%d")
     d1 = datetime.fromtimestamp(end_ms / 1000, KST).strftime("%Y-%m-%d")
     pf = "∞" if m["pf"] == float("inf") else f"{m['pf']:.2f}"
+    fund = FUNDING_KO.get(results[cur_risk].get("funding_mode"), "펀딩비")
     lines = [f"📊 백테스트 — 최근 {days}일 ({d0}~{d1}), {n_syms}종목",
-             "수수료 0.05%·슬리피지·펀딩비(보수적) 반영, 시작 $100", "",
+             f"수수료 0.05%·슬리피지·{fund} 반영, 시작 $100", "",
              f"[현재 설정: 1회 위험 {cur_risk:g}%]",
              f"최종 {usd(m['final'])} ({m['ret']:+.1f}%) | 최대낙폭 {m['max_dd']:.1f}%",
              f"거래 {m['n']}회 · 승률 {m['win']:.0f}% · 평균 {m['avg_r']:+.2f}R · 수익팩터 {pf}"]
