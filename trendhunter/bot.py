@@ -100,6 +100,8 @@ SETTABLE = {
     "spot_vol_target": (float, 0.2, 1.5),
     "spot_universe_size": (int, 1, 10),
     "spot_band_pct": (float, 1.0, 20.0),
+    "spot_btc_gate": (bool, None, None),
+    "spot_btc_gate_min": (float, 0.0, 1.0),
     "spot_candidates": ("spotlist", None, None),
     "update_url": (str, None, None),
     "brief_morning_kst": ("hhmm", None, None),
@@ -1128,6 +1130,8 @@ class Trader:
             sp = [t for t in self.store.read_all("spot_trades.jsonl") if t.get("ts", 0) >= since
                   and t.get("mode") == self.state["mode"]]
             lines.append("[현물] " + (f"오늘 리밸런싱 {len(sp)}건" if sp else "변경 없음") + " (매일 09:05 KST)")
+            if name == "morning":
+                lines.append(self.spot.gate_line())
             lines.extend(self.spot.lines(detail=True))
         if name == "evening":
             lines.append("폰 반납 후에도 봇과 거래소 손절은 계속 작동합니다. 내일 08시에 다시 보고할게요.")
@@ -1324,10 +1328,13 @@ class Trader:
         last = st.get("last_run")
         lines = ["🪙 현물 — 추세 모멘텀 + 변동성 맞춤 비중 (레버리지 없음)",
                  f"운용 종목(거래대금 상위 {self.cfg.get('spot_universe_size', 6)}): {uni}",
-                 f"마지막 리밸런싱: {hhmm(last) if last else '아직 없음'} | 다음: 매일 09:05 KST"]
+                 f"마지막 리밸런싱: {hhmm(last) if last else '아직 없음'} | 다음: 매일 09:05 KST",
+                 self.spot.gate_line()]
         lines += self.spot.lines(detail=True)
         lines.append("신호 n/4 = 20·60·120·250일 전보다 오른 기간 수. 4/4면 강한 상승, 0/4면 현금(USDT) 대피.")
         lines.append("목표 비중 = 신호 × 변동성 역비례(변동성 큰 코인은 적게). 합계가 100%를 넘지 않습니다.")
+        lines.append(f"BTC 게이트: BTC 신호가 {float(self.cfg.get('spot_btc_gate_min', 0.5)) * 4:g}/4 미만이면 "
+                     "BTC를 뺀 코인의 목표 비중을 0으로 합니다.")
         self.send("\n".join(lines))
 
     def cmd_alloc(self, args):
@@ -1540,7 +1547,7 @@ class Trader:
 
     def cmd_settings(self, args):
         keys = ["spot_enabled", "alloc_spot_pct", "alloc_band_pct", "spot_candidates", "spot_universe_size",
-                "spot_vol_target", "spot_band_pct",
+                "spot_vol_target", "spot_band_pct", "spot_btc_gate", "spot_btc_gate_min",
                 "symbols", "signal_tf", "trend_tf", "allow_long", "allow_short", "risk_per_trade_pct", "max_leverage", "max_open_positions", "max_same_direction",
                 "max_entries_per_day", "daily_loss_limit_pct", "loss_streak_limit", "loss_streak_pause_hours",
                 "cooldown_after_loss_hours", "equity_floor_pct", "time_stop_hours", "adx_min",
@@ -1987,13 +1994,19 @@ def check(data_dir):
     store = Store(data_dir)
     cfg = load_config(APP_DIR, store)
     for key in ("symbols", "signal_tf", "trend_tf", "risk_per_trade_pct", "ma_periods",
-                "spot_candidates", "spot_lookbacks", "spot_vol_target", "alloc_spot_pct", "monthly_report"):
+                "spot_candidates", "spot_lookbacks", "spot_vol_target", "alloc_spot_pct", "monthly_report",
+                "spot_btc_gate", "spot_btc_gate_min"):
         if key not in cfg:
             raise SystemExit(f"config missing {key}")
     if not 0 <= float(cfg["alloc_spot_pct"]) <= 100:
         raise SystemExit("bad alloc_spot_pct")
     if not isinstance(cfg["monthly_report"], bool):
         raise SystemExit("bad monthly_report (true/false)")
+    if not isinstance(cfg["spot_btc_gate"], bool):
+        raise SystemExit("bad spot_btc_gate (true/false)")
+    if isinstance(cfg["spot_btc_gate_min"], bool) or not isinstance(cfg["spot_btc_gate_min"], (int, float)) \
+            or not 0 <= cfg["spot_btc_gate_min"] <= 1:
+        raise SystemExit("bad spot_btc_gate_min (0~1)")
     if cfg["signal_tf"] not in TF_SECONDS or cfg["trend_tf"] not in TF_SECONDS:
         raise SystemExit("bad timeframe")
     print(f"OK {cfg['bot_name']} {cfg['version']}")

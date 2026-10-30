@@ -6,6 +6,7 @@ follow exactly the same rules as the research tournament:
   weight_i  = signal_i * (vol_target / N) / max(ann_vol_60d_i, 15%)        (capped at max_weight)
   gross     = sum(weight) <= 1  (spot: no leverage, the rest stays in USDT)
   universe  = top-N candidates by average 365-day quote volume, refreshed monthly
+  BTC gate  = when BTC's own signal is below spot_btc_gate_min, every coin except BTC gets weight 0
 """
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ import math
 import time
 
 DAY_MS = 86_400_000
+BTC = "BTCUSDT"
 
 
 def daily_series(rows, now_ms=None):
@@ -64,8 +66,23 @@ def select_universe(series, candidates, n=6, lookback=365, min_days=365):
     return [sym for _, sym in scored[:int(n)]]
 
 
+def btc_gate(series, p):
+    """BTC trend gate. None when it is switched off or BTC lacks the daily history for every lookback
+    (then nothing is gated); else {"frac": BTC momentum fraction, "min": threshold, "open": alts allowed}."""
+    if not p.get("spot_btc_gate", True):
+        return None
+    lbs = [int(x) for x in p.get("spot_lookbacks", [20, 60, 120, 250])]
+    s = series.get(BTC)
+    if not s or not lbs or len(s["c"]) <= max(lbs):
+        return None
+    frac = momentum_fraction(s["c"], lbs)
+    lo = float(p.get("spot_btc_gate_min", 0.5))
+    return {"frac": frac, "min": lo, "open": frac >= lo}
+
+
 def target_weights(series, universe, p):
-    """Returns ({sym: weight}, {sym: diag}) for the universe. Weights sum to <= max_gross."""
+    """Returns ({sym: weight}, {sym: diag}) for the universe. Weights sum to <= max_gross.
+    A closed BTC gate zeroes every coin except BTC, whose weight stays what it would have been."""
     lbs = [int(x) for x in p.get("spot_lookbacks", [20, 60, 120, 250])]
     vt = float(p.get("spot_vol_target", 0.6))
     vn = int(p.get("spot_vol_days", 60))
@@ -89,6 +106,9 @@ def target_weights(series, universe, p):
     if g > max_gross > 0:
         k = max_gross / g
         w = {s: x * k for s, x in w.items()}
+    gate = btc_gate(series, p)
+    if gate and not gate["open"]:
+        w = {s: (x if s == BTC else 0.0) for s, x in w.items()}
     return w, diag
 
 

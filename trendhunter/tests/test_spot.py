@@ -86,6 +86,75 @@ class SpotRules(unittest.TestCase):
         self.assertEqual(w["X"], 0.0, "ends the crash in cash")
 
 
+def _wavy(base, growth, days, amp=0.01):
+    import math
+    return [base * growth ** i * (1 + amp * math.sin(i * 1.3)) for i in range(days)]
+
+
+class BtcGate(unittest.TestCase):
+    """v2.2: BTC's own momentum gates the alts (spot sleeve only)."""
+    P = dict(SpotRules.P, spot_btc_gate=True, spot_btc_gate_min=0.5)
+    UNI = ["BTCUSDT", "AAAUSDT", "BBBUSDT"]
+
+    def btc_down(self):
+        # long decline, short bounce: only the 20-day lookback is up -> BTC signal 1/4
+        return [100 * 0.996 ** i for i in range(280)] + [100 * 0.996 ** 279 * 1.004 ** i for i in range(1, 26)]
+
+    def series(self, btc):
+        return {"BTCUSDT": series_from(btc), "AAAUSDT": series_from(_wavy(10, 1.003, len(btc))),
+                "BBBUSDT": series_from(_wavy(5, 1.002, len(btc), 0.02))}
+
+    def test_btc_downtrend_zeroes_alts_and_keeps_btc(self):
+        s = self.series(self.btc_down())
+        g = SS.btc_gate(s, self.P)
+        self.assertEqual(g["frac"], 0.25)
+        self.assertFalse(g["open"])
+        gated, _ = SS.target_weights(s, self.UNI, self.P)
+        free, _ = SS.target_weights(s, self.UNI, dict(self.P, spot_btc_gate=False))
+        self.assertGreater(free["AAAUSDT"], 0.0)
+        self.assertGreater(free["BBBUSDT"], 0.0)
+        self.assertEqual(gated["AAAUSDT"], 0.0)
+        self.assertEqual(gated["BBBUSDT"], 0.0)
+        self.assertGreater(gated["BTCUSDT"], 0.0)
+        self.assertEqual(gated["BTCUSDT"], free["BTCUSDT"], "BTC keeps exactly its ungated weight")
+
+    def test_btc_uptrend_changes_nothing(self):
+        s = self.series(_wavy(100, 1.003, 305))
+        self.assertTrue(SS.btc_gate(s, self.P)["open"])
+        self.assertEqual(SS.target_weights(s, self.UNI, self.P),
+                         SS.target_weights(s, self.UNI, dict(self.P, spot_btc_gate=False)))
+
+    def test_gate_off_is_the_old_behaviour(self):
+        s = self.series(self.btc_down())
+        off = dict(self.P, spot_btc_gate=False)
+        self.assertIsNone(SS.btc_gate(s, off))
+        # the pre-gate rules, reproduced by hiding BTC's name from the gate
+        old = {("XBTUSDT" if k == "BTCUSDT" else k): v for k, v in s.items()}
+        w_old, d_old = SS.target_weights(old, ["XBTUSDT", "AAAUSDT", "BBBUSDT"], self.P)
+        w_off, d_off = SS.target_weights(s, self.UNI, off)
+        self.assertEqual(w_off, {("BTCUSDT" if k == "XBTUSDT" else k): v for k, v in w_old.items()})
+        self.assertEqual(d_off, {("BTCUSDT" if k == "XBTUSDT" else k): v for k, v in d_old.items()})
+
+    def test_missing_or_short_btc_history_does_not_gate(self):
+        s = self.series(self.btc_down())
+        short = dict(s, BTCUSDT=series_from(self.btc_down()[-250:]))  # 250 days: the 250-day lookback is missing
+        self.assertIsNone(SS.btc_gate(short, self.P))
+        w, _ = SS.target_weights(short, self.UNI, self.P)
+        self.assertGreater(w["AAAUSDT"], 0.0)
+        no_btc = {k: v for k, v in s.items() if k != "BTCUSDT"}
+        w2, _ = SS.target_weights(no_btc, self.UNI, self.P)
+        self.assertGreater(w2["AAAUSDT"], 0.0)
+
+    def test_backtest_uses_the_same_gate(self):
+        s = self.series(self.btc_down() + [100 * 0.996 ** 279 * 1.004 ** 25 * 0.998 ** i for i in range(1, 60)])
+        p = dict(self.P, spot_universe_size=3, spot_universe_min_days=300)
+        start = 300 * 86_400_000
+        on = SS.simulate(s, p, start, start_equity=10_000)
+        off = SS.simulate(s, dict(p, spot_btc_gate=False), start, start_equity=10_000)
+        self.assertNotEqual([e for _, e in on], [e for _, e in off])
+        self.assertGreater(off[-1][1], on[-1][1], "the alts kept rising, so blocking them cost money here")
+
+
 class SpotFlows(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -126,6 +195,17 @@ class SpotFlows(unittest.TestCase):
         self.assertEqual(len(store.read_all("transfers.jsonl")), 1, "inside the band -> no churn")
         tr.cmd_spot([])
         self.assertTrue(any(t.startswith("🪙 현물") for t in tg.texts()))
+        gate = tr.spot.gate_line()
+        g = tr.state["spot"]["btc_gate"]["info"]
+        self.assertEqual(gate, f"BTC 신호 {int(round(g['frac'] * 4))}/4 · 알트 {'허용' if g['open'] else '차단'}")
+        self.assertIn(gate, tg.texts()[-1])
+        self.assertIn(gate, tr.brief_text("morning", self.clock()))
+        self.assertNotIn("BTC 신호", tr.brief_text("evening", self.clock()))
+        tr.handle_update({"message": {"chat": {"id": 42}, "text": "/set spot_btc_gate false"}})
+        self.assertFalse(tr.cfg["spot_btc_gate"])
+        self.assertEqual(tr.spot.gate_line(), "BTC 게이트 꺼짐 · 알트 허용")
+        tr.handle_update({"message": {"chat": {"id": 42}, "text": "/set spot_btc_gate_min 1.5"}})
+        self.assertEqual(tr.cfg["spot_btc_gate_min"], 0.5, "outside 0~1 is refused")
         tr.cmd_export([])
         name, data, cap = tg.docs[-1]
         rows = list(csv.reader(io.StringIO(data.decode("utf-8-sig"))))
