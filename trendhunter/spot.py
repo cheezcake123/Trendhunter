@@ -293,6 +293,10 @@ class SpotManager:
                               + f"\n빠짐: {', '.join(s[:-4] for s in old if s not in uni) or '-'} / "
                               f"새로: {', '.join(s[:-4] for s in uni if s not in old) or '-'}")
         w, diag = SS.target_weights(series, self.state["universe"], self.cfg)
+        # for the screens: BTC's signal even while the gate is switched off (None = not enough BTC history)
+        g = SS.btc_gate(series, dict(self.cfg, spot_btc_gate=True))
+        self.state["btc_gate"] = {"ts": now, "info": g,
+                                  "n": len(self.cfg.get("spot_lookbacks") or [20, 60, 120, 250])}
         return w, diag
 
     # ------------------------------------------------------------ the daily job
@@ -355,6 +359,19 @@ class SpotManager:
         return {"trades": done, "errors": errors, "targets": w, "diag": diag, "equity": E}
 
     # ------------------------------------------------------------ text
+    def gate_line(self):
+        """'BTC 신호 n/4 · 알트 허용/차단' from the last rebalance."""
+        if not self.cfg.get("spot_btc_gate", True):
+            return "BTC 게이트 꺼짐 · 알트 허용"
+        st = self.state.get("btc_gate")
+        if not st:
+            return "BTC 신호: 다음 리밸런싱(09:05 KST) 때 계산"
+        g = st.get("info")
+        if not g:
+            return "BTC 신호 데이터 부족 · 알트 허용(게이트 미적용)"
+        n = int(st.get("n") or 4)
+        return f"BTC 신호 {int(round(g['frac'] * n))}/{n} · 알트 {'허용' if g['open'] else '차단'}"
+
     def lines(self, detail=True):
         v = self.cache or {}
         eq = v.get("equity", 0.0)

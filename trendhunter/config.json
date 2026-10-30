@@ -1,6 +1,6 @@
 {
   "bot_name": "TrendHunter",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "spot_enabled": true,
   "alloc_spot_pct": 50,
   "alloc_band_pct": 10,
@@ -35,6 +35,8 @@
   "spot_slippage_bps": 5,
   "spot_kline_days": 420,
   "spot_rebalance_delay_s": 300,
+  "spot_btc_gate": true,
+  "spot_btc_gate_min": 0.5,
   "symbols": [
     "BTCUSDT",
     "ETHUSDT",
