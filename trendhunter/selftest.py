@@ -130,6 +130,23 @@ def run_spot_checks(sapi, cfg):
             blocking=False)
     except (BinanceError, NetworkError) as e:
         add("API 키 권한 조회", False, _explain(e))
+    earn = 0.0
+    if cfg.get("spot_earn"):
+        # Simple Earn subscribe/redeem are TRADE endpoints: the key's spot trading permission covers them
+        try:
+            rows = sapi.earn_flexible_list("USDT", retries=0)
+            prod = next((r for r in rows if r.get("canPurchase", True) and not r.get("isSoldOut")), None)
+            earn = sum(float(r.get("totalAmount") or 0) for r in sapi.earn_flexible_position("USDT", retries=0))
+            add("Simple Earn 유연 예치(USDT)", bool(prod),
+                (f"상품 {prod['productId']} · 최소 {float(prod.get('minPurchaseAmount') or 0):g} USDT · "
+                 f"연 {float(prod.get('latestAnnualPercentageRate') or 0) * 100:.2f}% · 현재 예치 {earn:.2f} USDT")
+                if prod else "예치 가능한 USDT 유연 상품이 없습니다", blocking=False)
+        except (BinanceError, NetworkError) as e:
+            add("Simple Earn 유연 예치(USDT)", False, _explain(e) + " — 예치·환매에는 'Enable Spot & Margin Trading' "
+                "권한이 필요합니다. 실패해도 매매는 계속되고 이자만 받지 못합니다.", blocking=False)
+    else:
+        add("Simple Earn 유연 예치(USDT)", None, "꺼짐 — 켜기: /set spot_earn true (필요 권한: 현물 거래)",
+            blocking=False)
     try:
         bal = sapi.balances()
         usdt = sum(bal.get("USDT", {}).get(k, 0.0) for k in ("free", "locked"))
@@ -139,8 +156,9 @@ def run_spot_checks(sapi, cfg):
         vals = {a: (b["free"] + b["locked"]) * prices.get(bases[a], 0.0) for a, b in held.items()}
         coins = sum(vals.values())
         listing = ", ".join(f"{a} ${v:,.2f}" for a, v in sorted(vals.items(), key=lambda x: -x[1]) if v >= 1.0)
-        add("현물 지갑", None, f"USDT {usdt:.2f} + 코인 {coins:.2f} = {usdt + coins:.2f} USDT"
-            + (f" ({listing})" if listing else ""), blocking=False, spot_equity=usdt + coins,
+        parked = f" + 이자 예치 {earn:.2f}" if earn > 0.01 else ""
+        add("현물 지갑", None, f"USDT {usdt:.2f} + 코인 {coins:.2f}{parked} = {usdt + coins + earn:.2f} USDT"
+            + (f" ({listing})" if listing else ""), blocking=False, spot_equity=usdt + coins + earn,
             spot_coins=coins, spot_listing=listing)
     except (BinanceError, NetworkError) as e:
         add("현물 지갑", False, _explain(e))

@@ -114,6 +114,14 @@ class FakeExchange:
         self.drop_order_response = 0    # futures: execute the order, then answer 503
         self.hide_order_lookups = 0     # futures: the next N lookups say "does not exist"
         self.funding_rate = None        # futures: set a rate (e.g. 0.0001) to serve /fapi/v1/fundingRate history
+        # ---- Simple Earn (flexible USDT)
+        self.earn_usdt = 0.0
+        self.earn_rewards = 0.0
+        self.earn_min = 0.1
+        self.earn_ops = []               # (kind, params) of every subscribe / redeem that went through
+        self.earn_fail_redeem = False    # True: redeem answers an error
+        self.earn_fail_subscribe = False
+        self.earn_fail_read = False      # True: list / position answer 503
 
     # ------------------------------------------------------------ prices
     def _minute(self, ts_ms):
@@ -334,7 +342,49 @@ class FakeExchange:
             return self.spot_order(method, P, now_ms)
         if path == "/api/v3/myTrades":
             return 200, [t for t in self.spot_trades if t["symbol"] == P["symbol"]]
+        if path.startswith("/sapi/v1/simple-earn/flexible/"):
+            return self.earn_route(method, path.rsplit("/", 1)[-1], P)
         return 404, {"code": -5000, "msg": f"no route {path}"}
+
+    def earn_route(self, method, op, P):
+        if op in ("list", "position") and self.earn_fail_read:
+            return 503, {"code": -1001, "msg": "Internal error; unable to process your request."}
+        if op == "list" and method == "GET":
+            return 200, {"total": 1, "rows": [{
+                "asset": "USDT", "productId": "USDT001", "minPurchaseAmount": f"{self.earn_min:.8f}",
+                "canPurchase": True, "canRedeem": True, "isSoldOut": False, "status": "PURCHASING",
+                "latestAnnualPercentageRate": "0.05000000"}]}
+        if op == "position" and method == "GET":
+            rows = [] if self.earn_usdt <= 0 else [{
+                "asset": "USDT", "productId": "USDT001", "totalAmount": f"{self.earn_usdt:.8f}", "canRedeem": True,
+                "latestAnnualPercentageRate": "0.05000000", "cumulativeTotalRewards": f"{self.earn_rewards:.8f}",
+                "autoSubscribe": False}]
+            return 200, {"total": len(rows), "rows": rows}
+        if op == "subscribe" and method == "POST":
+            if self.earn_fail_subscribe:
+                return self.err(-6003, "Product not exist or you don't have permission")
+            amt = float(P["amount"])
+            if P.get("productId") != "USDT001" or amt < self.earn_min:
+                return self.err(-6005, "Smaller than min purchase limit")
+            if self.spot_bal.get("USDT", 0.0) + 1e-9 < amt:
+                return self.err(-6012, "Balance not enough")
+            self.spot_bal["USDT"] -= amt
+            self.earn_usdt += amt
+            self.seq += 1
+            self.earn_ops.append(("subscribe", dict(P)))
+            return 200, {"purchaseId": self.seq, "success": True}
+        if op == "redeem" and method == "POST":
+            if self.earn_fail_redeem:
+                return self.err(-6001, "Daily product not exists.")
+            amt = self.earn_usdt if P.get("redeemAll") == "true" else float(P["amount"])
+            if amt > self.earn_usdt + 1e-9:
+                return self.err(-6012, "Balance not enough")
+            self.earn_usdt -= amt
+            self.spot_bal["USDT"] = self.spot_bal.get("USDT", 0.0) + amt
+            self.seq += 1
+            self.earn_ops.append(("redeem", dict(P)))
+            return 200, {"redeemId": self.seq, "success": True}
+        return 404, {"code": -5000, "msg": f"no route {op}"}
 
     def spot_order(self, method, P, now_ms):
         if method == "GET":
@@ -406,7 +456,7 @@ class FakeExchange:
         return 200, dict(o)
 
     def spot_value(self):
-        v = self.spot_bal.get("USDT", 0.0)
+        v = self.spot_bal.get("USDT", 0.0) + self.earn_usdt
         for sym in self.symbols:
             v += self.spot_bal.get(sym[:-4], 0.0) * self.price(sym)
         return v

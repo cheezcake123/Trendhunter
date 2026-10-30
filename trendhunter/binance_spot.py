@@ -1,7 +1,8 @@
 """Minimal Binance Spot + wallet (SAPI) REST client. Shares signing/retry code with BinanceFutures.
 
 Only what the spot sleeve needs: prices, daily klines, balances, MARKET orders, order lookup,
-trade history, universal transfer between the spot and USDⓈ-M futures wallets, API key restrictions.
+trade history, universal transfer between the spot and USDⓈ-M futures wallets, API key restrictions,
+Simple Earn flexible products (idle USDT earns interest).
 """
 from __future__ import annotations
 
@@ -81,6 +82,38 @@ class BinanceSpot(BinanceFutures):
         """kind: MAIN_UMFUTURE (spot -> USDⓈ-M futures) or UMFUTURE_MAIN (futures -> spot)."""
         return self._request("POST", "/sapi/v1/asset/transfer",
                              {"type": kind, "asset": asset, "amount": amount}, signed=True)
+
+    # ------------------------------------------------------------ Simple Earn (flexible)
+    # Binance docs (Simple Earn): list/position are USER_DATA (IP weight 150 each); subscribe/redeem are TRADE
+    # (IP weight 1, at most one call per 3 s per account) and need the key's spot trading permission.
+    def earn_flexible_list(self, asset="USDT", retries=None):
+        """Flexible products: rows of {asset, productId, minPurchaseAmount, canPurchase, isSoldOut, status,
+        latestAnnualPercentageRate, ...}."""
+        r = self._request("GET", "/sapi/v1/simple-earn/flexible/list", {"asset": asset, "size": 100},
+                          signed=True, retries=retries)
+        return (r or {}).get("rows") or []
+
+    def earn_flexible_position(self, asset="USDT", retries=None):
+        """Holdings: rows of {asset, productId, totalAmount, canRedeem, latestAnnualPercentageRate,
+        cumulativeTotalRewards, ...}."""
+        r = self._request("GET", "/sapi/v1/simple-earn/flexible/position", {"asset": asset, "size": 100},
+                          signed=True, retries=retries)
+        return (r or {}).get("rows") or []
+
+    def earn_subscribe(self, product_id, amount):
+        """Move `amount` from the SPOT wallet into the product. autoSubscribe=false: otherwise Binance keeps
+        sweeping the spot wallet the bot trades from into Earn. Returns {purchaseId, success}."""
+        return self._request("POST", "/sapi/v1/simple-earn/flexible/subscribe", {
+            "productId": product_id, "amount": amount, "autoSubscribe": False, "sourceAccount": "SPOT"}, signed=True)
+
+    def earn_redeem(self, product_id, amount=None, redeem_all=False):
+        """Back to the SPOT wallet: `amount`, or everything. Returns {redeemId, success}."""
+        params = {"productId": product_id, "destAccount": "SPOT"}
+        if redeem_all:
+            params["redeemAll"] = True
+        else:
+            params["amount"] = amount
+        return self._request("POST", "/sapi/v1/simple-earn/flexible/redeem", params, signed=True)
 
 
 def parse_spot_filters(exinfo, symbols=None):

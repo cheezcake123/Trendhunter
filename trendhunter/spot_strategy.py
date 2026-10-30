@@ -151,7 +151,9 @@ def month_key(ms):
 # ---------------------------------------------------------------- backtest (pure python)
 
 def simulate(series, p, start_ms, fee=0.001, slip=0.0005, start_equity=100.0):
-    """Daily spot simulation of the live rules. series: {sym: daily_series}. Returns [(t_close_ms, equity)]."""
+    """Daily spot simulation of the live rules. series: {sym: daily_series}. Returns [(t_close_ms, equity)].
+    With spot_earn on, idle USDT above the 2 USDT wallet buffer earns spot_cash_yield per year (daily)."""
+    daily_yield = float(p.get("spot_cash_yield", 0.03)) / 365.0 if p.get("spot_earn") else 0.0
     cands = list(series)
     days = sorted({t for s in series.values() for t in s["t"] if t >= start_ms})
     idx = {sym: {t: i for i, t in enumerate(s["t"])} for sym, s in series.items()}
@@ -172,6 +174,8 @@ def simulate(series, p, start_ms, fee=0.001, slip=0.0005, start_equity=100.0):
             last_px[sym] = series[sym]["c"][i]
             s = series[sym]
             view[sym] = {"t": s["t"][:i + 1], "c": s["c"][:i + 1], "qv": s["qv"][:i + 1]}
+        if daily_yield and cash > 2.0:
+            cash += (cash - 2.0) * daily_yield  # yesterday's idle USDT sat in flexible Earn
         month = month_key(t + DAY_MS)
         if uni_month != month or not universe:
             universe = select_universe(view, cands, n_uni, lb, int(p.get("spot_universe_min_days", 365))) or universe

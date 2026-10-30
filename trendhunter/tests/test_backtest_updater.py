@@ -123,7 +123,8 @@ class ConfigCheckTests(unittest.TestCase):
                 json.dump({"monthly_report": "yes"}, fh)
             with self.assertRaises(SystemExit):
                 bot.check(tmp)
-            for bad in ({"spot_btc_gate": "on"}, {"spot_btc_gate_min": 1.5}, {"spot_btc_gate_min": "0.5"}):
+            for bad in ({"spot_btc_gate": "on"}, {"spot_btc_gate_min": 1.5}, {"spot_btc_gate_min": "0.5"},
+                        {"spot_earn": "true"}, {"spot_cash_yield": 0.5}, {"spot_cash_yield": True}):
                 with open(os.path.join(tmp, "settings.json"), "w", encoding="utf-8") as fh:
                     json.dump(bad, fh)
                 with self.assertRaises(SystemExit, msg=str(bad)):

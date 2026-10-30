@@ -339,5 +339,159 @@ class SpotFlows(unittest.TestCase):
         self.assertGreater(len(out["mixes"][0.5]), 30)
 
 
+class SpotEarn(unittest.TestCase):
+    """v2.3: idle spot USDT waits in Simple Earn (flexible); it stays sleeve money and never blocks trading."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def make(self, mode="live", days=6, earn=True):
+        self.clock = SimClock(START)
+        self.fake = FakeExchange(self.clock, history_days=430, test_days=days + 1)
+        return make_trader(self.fake, self.clock, self.tmp, mode=mode, over={"spot_earn": earn}, spot=True)
+
+    def run_days(self, tr, days, step=600):
+        for _ in range(int(days * DAY / step)):
+            self.clock.advance(step)
+            tr.step()
+
+    def earn_calls(self, method=None):
+        return [c for c in self.fake.calls if "simple-earn" in c[1] and (method is None or c[0] == method)]
+
+    def total_matches_exchange(self, tr):
+        tr.spot.value(refresh=True)
+        tot, sv, fv = tr.total_equity()
+        real = self.fake.spot_value() + self.fake.wallet + self.fake.upnl()
+        self.assertAlmostEqual(tot, real, delta=real * 0.01 + 0.05, msg="parked USDT must stay in the valuation")
+
+    def test_parks_leftover_and_redeems_before_a_transfer(self):
+        tr, tg, store = self.make()
+        tr.startup()
+        self.run_days(tr, 1)
+        subs = [p for k, p in self.fake.earn_ops if k == "subscribe"]
+        self.assertTrue(subs, "leftover USDT is parked after the daily run")
+        self.assertEqual(subs[0]["autoSubscribe"], "false", "Binance must not sweep the spot wallet on its own")
+        self.assertEqual(subs[0]["sourceAccount"], "SPOT")
+        self.assertGreater(self.fake.earn_usdt, 1.0)
+        self.assertLessEqual(self.fake.spot_bal["USDT"], 2.0 + 0.011, "2 USDT stay in the spot wallet")
+        self.assertAlmostEqual(tr.spot.value(refresh=True)["earn"], self.fake.earn_usdt, places=6)
+        self.total_matches_exchange(tr)
+        # the user moves the target to 20 % spot: the sleeve must send money to futures, so Earn pays it out first
+        tr._save_setting("alloc_spot_pct", 20.0)
+        tr.force_rebalance()
+        n_out = len([t for t in self.fake.transfers if t["type"] == "MAIN_UMFUTURE"])
+        self.clock.advance(60)
+        tr.step()
+        self.assertTrue([k for k, _ in self.fake.earn_ops if k == "redeem"], "redeemed before the transfer")
+        self.assertGreater(len([t for t in self.fake.transfers if t["type"] == "MAIN_UMFUTURE"]), n_out)
+        self.total_matches_exchange(tr)
+        tot, sv, fv = tr.total_equity()
+        self.assertAlmostEqual(sv / tot, 0.20, delta=0.05)
+        tr.cmd_spot([])
+        self.assertIn("이자 예치(유연 USDT) $", tg.texts()[-1])
+        self.assertIn("누적 이자", tg.texts()[-1])
+        tr.cmd_export([])
+        rows = list(csv.reader(io.StringIO(tg.docs[-1][1].decode("utf-8-sig"))))
+        kinds = {r[0] for r in rows[1:]}
+        self.assertIn("이자예치", kinds)
+        self.assertIn("이자환매", kinds)
+
+    def test_failed_redemption_never_stops_trading(self):
+        tr, tg, store = self.make()
+        tr.startup()
+        self.run_days(tr, 1)
+        self.assertGreater(self.fake.earn_usdt, 1.0)
+        self.fake.earn_fail_redeem = True
+        n_trades = len(store.read_all("spot_trades.jsonl"))
+        tr._save_setting("alloc_spot_pct", 20.0)  # needs cash for sells -> transfer; Earn will refuse to pay out
+        tr.force_rebalance()
+        self.clock.advance(60)
+        tr.step()
+        st = tr.state["spot"]
+        self.assertEqual(st["fails"], 0, "the daily spot job itself still succeeded")
+        self.assertEqual(st["last_day"], B.utc_day(self.clock()))
+        self.assertGreater(len(store.read_all("spot_trades.jsonl")), n_trades, "sells still went through")
+        self.assertTrue(any("이자 예치 환매 실패" in t for t in tg.texts()))
+        self.total_matches_exchange(tr)
+        # no more deposit/redemption attempts for the rest of the day; only the hourly balance read for valuation
+        n_moves, n_reads = len(self.earn_calls("POST")), len(self.earn_calls("GET"))
+        tr.force_rebalance()
+        self.run_days(tr, 0.3)
+        self.assertEqual(len(self.earn_calls("POST")), n_moves, "Earn rests until tomorrow after a failure")
+        self.assertLessEqual(len(self.earn_calls("GET")) - n_reads, 8, "balance reads stay rare")
+        for sym in self.fake.positions:
+            self.assertEqual(len(self.fake.open_algos(sym)), 1)
+        # tomorrow it works again
+        self.fake.earn_fail_redeem = False
+        self.run_days(tr, 1)
+        self.assertTrue([k for k, _ in self.fake.earn_ops if k == "redeem"])
+
+    def test_unreadable_earn_balance_keeps_the_last_known_amount(self):
+        tr, tg, store = self.make()
+        tr.startup()
+        self.run_days(tr, 1)
+        parked = self.fake.earn_usdt
+        self.fake.earn_fail_read = True
+        v = tr.spot.value(refresh=True)
+        tr.spot.earn_value(refresh=True)
+        self.assertAlmostEqual(tr.spot.value(refresh=True)["earn"], parked, places=6)
+        self.assertGreater(v["equity"], parked)
+
+    def test_paper_mode_never_calls_earn_and_accrues_interest(self):
+        tr, tg, store = self.make(mode="paper", days=8)
+        tr.startup()
+        self.run_days(tr, 7)
+        self.assertEqual(self.earn_calls(), [], "paper mode must never call Binance Earn")
+        self.assertEqual(self.fake.earn_usdt, 0.0)
+        ps = tr.spot.ex.st
+        self.assertGreater(ps["earn"], 1.0, "virtual Earn balance")
+        self.assertGreater(ps["earn_rewards"], 0.0)
+        self.assertLess(ps["earn_rewards"], ps["earn"] * 0.03 * 8 / 365 * 1.5)
+        v = tr.spot.value(refresh=True)
+        self.assertGreater(v["earn"], 1.0)
+        self.assertAlmostEqual(v["equity"], v["usdt"] + v["earn"] + sum(h["val"] for h in v["holdings"].values()),
+                               places=6)
+        self.assertTrue(all(r["mode"] == "paper" for r in store.read_all("earn.jsonl")))
+
+    def test_switched_off_does_nothing(self):
+        tr, tg, store = self.make(earn=False)
+        tr.startup()
+        self.run_days(tr, 2)
+        self.assertEqual(self.earn_calls(), [])
+        self.assertEqual(store.read_all("earn.jsonl"), [])
+        self.assertIn("이자 예치 꺼짐", tr.spot.earn_line())
+
+    def test_selftest_checks_earn_access(self):
+        import selftest
+        self.make()
+        sapi = make_spot_api(self.fake, self.clock)
+        self.fake.earn_usdt = 12.5
+        res = selftest.run_spot_checks(sapi, {"spot_earn": True, "spot_candidates": list(self.fake.symbols)})
+        row = next(r for r in res if r["name"].startswith("Simple Earn"))
+        self.assertTrue(row["ok"])
+        self.assertFalse(row.get("blocking", True), "Earn trouble must never block /live")
+        wallet = next(r for r in res if r["name"] == "현물 지갑")
+        self.assertGreaterEqual(wallet["spot_equity"], 12.5, "parked USDT counts as spot money")
+        self.fake.earn_fail_read = True
+        res = selftest.run_spot_checks(sapi, {"spot_earn": True, "spot_candidates": list(self.fake.symbols)})
+        self.assertFalse(next(r for r in res if r["name"].startswith("Simple Earn"))["ok"])
+        off = selftest.run_spot_checks(sapi, {"spot_earn": False, "spot_candidates": list(self.fake.symbols)})
+        self.assertIsNone(next(r for r in off if r["name"].startswith("Simple Earn"))["ok"])
+
+    def test_backtest_pays_interest_on_idle_cash(self):
+        down = [100 * 0.997 ** i for i in range(700)]  # the sleeve sits in USDT the whole time
+        s = {"X": series_from(down, 1e9)}
+        p = dict(SpotRules.P, spot_universe_size=1, spot_universe_min_days=365, spot_cash_yield=0.05)
+        start = 380 * 86_400_000
+        off = SS.simulate(s, p, start, start_equity=10_000)
+        on = SS.simulate(s, dict(p, spot_earn=True), start, start_equity=10_000)
+        self.assertAlmostEqual(off[-1][1], 10_000, delta=1e-6)
+        days = len(on)
+        self.assertAlmostEqual(on[-1][1], 2 + 9_998 * (1 + 0.05 / 365) ** days, delta=0.5)
+
+
 if __name__ == "__main__":
     unittest.main()
