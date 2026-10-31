@@ -102,6 +102,8 @@ SETTABLE = {
     "spot_band_pct": (float, 1.0, 20.0),
     "spot_btc_gate": (bool, None, None),
     "spot_btc_gate_min": (float, 0.0, 1.0),
+    "spot_earn": (bool, None, None),
+    "spot_cash_yield": (float, 0.0, 0.3),
     "spot_candidates": ("spotlist", None, None),
     "update_url": (str, None, None),
     "brief_morning_kst": ("hhmm", None, None),
@@ -640,6 +642,7 @@ class Trader:
             moved_out = self.transfer(min(amt, cash * 0.999), to_futures=True)
         if not amt or moved_in or moved_out:
             self.state["force_alloc"] = False
+        parked = self.spot.earn_park(now)  # last: only what the trades and transfers left over (never raises)
         self.record_daily(now)
         if res["trades"] or res["errors"] or moved_in or moved_out:
             lines = ["🪙 현물 리밸런싱 (일봉 마감 기준)"]
@@ -647,6 +650,10 @@ class Trader:
                 lines.append(f"↔️ 선물 → 현물 {usd(moved_in, False)} 이체 (목표 배분 유지)")
             if moved_out:
                 lines.append(f"↔️ 현물 → 선물 {usd(moved_out, False)} 이체 (목표 배분 유지)")
+            if parked > 0:
+                lines.append(f"💤 남는 USDT {usd(parked, False)} 이자 예치(유연)")
+            elif parked < 0:
+                lines.append(f"💤 이자 예치 {usd(-parked, False)} 환매(예치 기능 꺼짐)")
             for t in res["trades"]:
                 lines.append(f"{'🟢 매수' if t['side'] == 'BUY' else '🔴 매도'} {short(t['sym'])} {usd(t['quote'], False)} "
                              f"(목표 {t['target_w'] * 100:.0f}%)")
@@ -1329,7 +1336,7 @@ class Trader:
         lines = ["🪙 현물 — 추세 모멘텀 + 변동성 맞춤 비중 (레버리지 없음)",
                  f"운용 종목(거래대금 상위 {self.cfg.get('spot_universe_size', 6)}): {uni}",
                  f"마지막 리밸런싱: {hhmm(last) if last else '아직 없음'} | 다음: 매일 09:05 KST",
-                 self.spot.gate_line()]
+                 self.spot.gate_line(), self.spot.earn_line()]
         lines += self.spot.lines(detail=True)
         lines.append("신호 n/4 = 20·60·120·250일 전보다 오른 기간 수. 4/4면 강한 상승, 0/4면 현금(USDT) 대피.")
         lines.append("목표 비중 = 신호 × 변동성 역비례(변동성 큰 코인은 적게). 합계가 100%를 넘지 않습니다.")
@@ -1423,6 +1430,12 @@ class Trader:
             if keep(t.get("ts", 0)):
                 rows.append(["지갑이체", kst(t["ts"]).strftime("%Y-%m-%d %H:%M"), t.get("mode"), "USDT",
                              "현물→선물" if t.get("to") == "futures" else "선물→현물", "", "", t.get("amount"), "", "", t.get("why")])
+        for t in self.store.read_all("earn.jsonl"):
+            if keep(t.get("ts", 0)):
+                rows.append(["이자예치" if t.get("kind") == "subscribe" else "이자환매",
+                             kst(t["ts"]).strftime("%Y-%m-%d %H:%M"), t.get("mode"), t.get("asset", "USDT"),
+                             "현물→유연 예치" if t.get("kind") == "subscribe" else "유연 예치→현물", "", "",
+                             t.get("amount"), "", "", f"{t.get('why', '')} · 번호 {t.get('id')}"])
         if len(rows) == 1:
             self.send("내보낼 기록이 없습니다.")
             return
@@ -1547,7 +1560,7 @@ class Trader:
 
     def cmd_settings(self, args):
         keys = ["spot_enabled", "alloc_spot_pct", "alloc_band_pct", "spot_candidates", "spot_universe_size",
-                "spot_vol_target", "spot_band_pct", "spot_btc_gate", "spot_btc_gate_min",
+                "spot_vol_target", "spot_band_pct", "spot_btc_gate", "spot_btc_gate_min", "spot_earn", "spot_cash_yield",
                 "symbols", "signal_tf", "trend_tf", "allow_long", "allow_short", "risk_per_trade_pct", "max_leverage", "max_open_positions", "max_same_direction",
                 "max_entries_per_day", "daily_loss_limit_pct", "loss_streak_limit", "loss_streak_pause_hours",
                 "cooldown_after_loss_hours", "equity_floor_pct", "time_stop_hours", "adx_min",
@@ -1708,7 +1721,7 @@ class Trader:
     def reset_spot_mode(self, mode):
         """Start the spot sleeve over for a new mode: fresh state, fresh paper wallet, fresh back-end."""
         st = self.state.setdefault("spot", {})
-        st.update(last_day=None, net_in=None, targets={}, diag={}, fails=0, retry_at=0.0, last_trades=[])
+        st.update(last_day=None, net_in=None, targets={}, diag={}, fails=0, retry_at=0.0, last_trades=[], earn={})
         self.state["total"] = {}
         self.state["hist"] = []
         self.state["hist_day"] = None
@@ -1995,7 +2008,7 @@ def check(data_dir):
     cfg = load_config(APP_DIR, store)
     for key in ("symbols", "signal_tf", "trend_tf", "risk_per_trade_pct", "ma_periods",
                 "spot_candidates", "spot_lookbacks", "spot_vol_target", "alloc_spot_pct", "monthly_report",
-                "spot_btc_gate", "spot_btc_gate_min"):
+                "spot_btc_gate", "spot_btc_gate_min", "spot_earn", "spot_cash_yield"):
         if key not in cfg:
             raise SystemExit(f"config missing {key}")
     if not 0 <= float(cfg["alloc_spot_pct"]) <= 100:
@@ -2007,6 +2020,11 @@ def check(data_dir):
     if isinstance(cfg["spot_btc_gate_min"], bool) or not isinstance(cfg["spot_btc_gate_min"], (int, float)) \
             or not 0 <= cfg["spot_btc_gate_min"] <= 1:
         raise SystemExit("bad spot_btc_gate_min (0~1)")
+    if not isinstance(cfg["spot_earn"], bool):
+        raise SystemExit("bad spot_earn (true/false)")
+    if isinstance(cfg["spot_cash_yield"], bool) or not isinstance(cfg["spot_cash_yield"], (int, float)) \
+            or not 0 <= cfg["spot_cash_yield"] <= 0.3:
+        raise SystemExit("bad spot_cash_yield (0~0.3)")
     if cfg["signal_tf"] not in TF_SECONDS or cfg["trend_tf"] not in TF_SECONDS:
         raise SystemExit("bad timeframe")
     print(f"OK {cfg['bot_name']} {cfg['version']}")

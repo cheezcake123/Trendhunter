@@ -158,8 +158,10 @@ def format_report(cfg, days, out):
     pf = "∞" if m["pf"] == float("inf") else f"{m['pf']:.2f}"
     final = out["mixes"][share][-1][1] if out["mixes"][share] else 100.0
     fund = BT.FUNDING_KO.get(out["fut"].get("funding_mode"), "펀딩비")
+    cash = (f"현물 현금 이자 연 {float(cfg.get('spot_cash_yield', 0.03)) * 100:g}% 반영" if cfg.get("spot_earn")
+            else "현물 현금 이자 미반영(/set spot_earn true 면 반영)")
     lines = [f"📊 백테스트 v2 — 최근 {days}일 ({d0}~{d1})",
-             f"수수료·슬리피지·{fund} 반영, 시작 $100, 매월 1일 배분 재조정", "",
+             f"수수료·슬리피지·{fund} 반영, 시작 $100, 매월 1일 배분 재조정", cash, "",
              f"[현재 설정: 현물 {share * 100:.0f}% + 선물 {100 - share * 100:.0f}%]",
              f"합계 ${final:,.2f} ({line(comb)})",
              f"· 현물 모멘텀({out['n_spot']}개 후보 중 거래대금 상위 {cfg.get('spot_universe_size', 6)}): {line(sp)}",
