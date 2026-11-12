@@ -58,20 +58,25 @@ EXIT_KO = {
 KEYBOARD = [["📊 상태", "💰 손익"], ["🪙 현물", "🔎 스캔"], ["📜 기록", "⚖️ 배분"], ["⏸ 정지", "▶️ 재개"], ["❓ 도움말"]]
 LABEL_CMD = {"📊 상태": "status", "💰 손익": "pnl", "🔎 스캔": "scan", "📜 기록": "log", "🪙 현물": "spot",
              "⚖️ 배분": "alloc", "⏸ 정지": "pause", "▶️ 재개": "resume", "❓ 도움말": "help"}
-PRESETS = {  # name: (spot %, futures risk per trade %, spot vol target) — see the research report
-    "안정": (70, 2.0, 0.6),
-    "기본": (50, 3.0, 0.6),
-    "공격": (40, 4.0, 0.6),
+PRESETS = {  # name: (spot %, futures risk per trade %, spot vol target, pyramiding adds)
+    "안정": (70, 2.0, 0.6, 2),
+    "기본": (50, 2.5, 0.6, 2),
+    "공격": (40, 3.0, 0.6, 2),
 }
-PRESET_NOTE = {  # v2.1 rules on Binance data 2020-01 ~ 2026-10, real funding rates
-    "안정": "과거 최대낙폭 약 -28%, 2024~26 연 31%",
-    "기본": "과거 최대낙폭 약 -35%, 2024~26 연 39%",
-    "공격": "과거 최대낙폭 약 -44%, 2024~26 연 48%",
+PRESET_NOTE = {  # v2.4 rules on Binance candles 2020-01 ~ 2026-11, funding assumed 0.03% per 8h
+    "안정": "과거 최대낙폭 약 -28%, 2024~26 연 42%",
+    "기본": "과거 최대낙폭 약 -35%, 2024~26 연 60%",
+    "공격": "과거 최대낙폭 약 -41%, 2024~26 연 74%",
+}
+WHATS_NEW = {
+    "2.4.0": "🆕 v2.4 — 불타기(수익 중 추가 진입)를 쓸 수 있습니다. 기본은 꺼져 있고 /preset 에서 단계를 고르면 켜집니다.\n"
+             "선물 진입은 이제 같은 포지션 크기를 더 적은 증거금으로 잡습니다(레버리지 숫자는 커지지만 손절 위험은 같고, "
+             "손절이 미끄러질 때 잃을 수 있는 최대 금액이 줄어듭니다).",
 }
 COMMANDS = [
     ("status", "현재 상태·보유 포지션"), ("pnl", "손익 성과"), ("spot", "현물 보유·목표 비중"),
     ("alloc", "현물/선물 배분: /alloc 50"), ("preset", "위험 단계: /preset 기본"), ("scan", "종목별 신호 상태"),
-    ("log", "최근 판단 기록"), ("pause", "신규 진입 일시정지"), ("resume", "신규 진입 재개"),
+    ("log", "최근 판단 기록"), ("pause", "신규 진입·불타기 일시정지"), ("resume", "신규 진입 재개"),
     ("close", "포지션 청산: /close BTC"), ("closeall", "전체 청산"), ("risk", "1회 위험 변경: /risk 3"),
     ("settings", "설정 보기"), ("set", "설정 변경: /set 키 값"), ("backtest", "백테스트: /backtest 365"),
     ("selftest", "계정·API 점검"), ("live", "실전 모드 전환"), ("paper", "모의 모드 전환"),
@@ -90,6 +95,10 @@ SETTABLE = {
     "loss_streak_pause_hours": (float, 0.0, 72.0),
     "cooldown_after_loss_hours": (float, 0.0, 72.0),
     "time_stop_hours": (float, 0.0, 480.0),
+    "pyramid_max_adds": (int, 0, 3),
+    "pyramid_step_r": (float, 0.5, 5.0),
+    "pyramid_risk_frac": (float, 0.1, 1.0),
+    "liq_buffer_mult": (float, 0.0, 5.0),
     "allow_short": (bool, None, None),
     "allow_long": (bool, None, None),
     "adx_min": (float, 0.0, 50.0),
@@ -186,6 +195,7 @@ class Trader:
         self.spot_ready = False
         self.spot_next_try = 0.0
         st = store.load_state() or {}
+        self.ran_before = bool(st.get("ledger"))  # False on a fresh install
         st.setdefault("mode", "paper")
         st.setdefault("paused", False)
         st.setdefault("positions", {})
@@ -210,6 +220,7 @@ class Trader:
         self.err_count = 0
         self.err_alerted = False
         self.last_alert = {}
+        self.candle_retry = None
 
     # ------------------------------------------------------------ basics
     @property
@@ -301,6 +312,12 @@ class Trader:
         if self.state.get("paused"):
             lines.append("⏸ 일시정지 상태입니다 (/resume 으로 재개)")
         self.send("\n".join(lines), keyboard=KEYBOARD)
+        ver = str(self.cfg["version"])
+        if self.state.get("seen_version") != ver:
+            if (self.state.get("seen_version") or self.ran_before) and ver in WHATS_NEW:  # an update, not a new install
+                self.send(WHATS_NEW[ver])
+            self.state["seen_version"] = ver
+            self.save()
 
     def load_filters(self):
         info = self.api.exchange_info()
@@ -333,11 +350,14 @@ class Trader:
         return problems
 
     # ------------------------------------------------------------ market data
-    def refresh_data(self):
+    def refresh_data(self, only=None):
         now = self.now()
         now_ms = int(now * 1000)
         tf_sec = TF_SECONDS[self.cfg["signal_tf"]]
+        last_close_ms = int(now // tf_sec) * tf_sec * 1000 - 1  # close time of the candle that closed last
         for sym in self.symbols():
+            if only is not None and sym not in only:
+                continue
             try:
                 raw1 = self.api.klines(sym, self.cfg["signal_tf"], limit=500)
                 raw4 = self.api.klines(sym, self.cfg["trend_tf"], limit=1000)
@@ -355,8 +375,12 @@ class Trader:
             i = len(ind["c"]) - 1
             reg = S.regime_at(r4, ind["tc"][i])
             sig = S.evaluate(ind, i, reg, self.cfg)
-            fresh = (now_ms - ind["tc"][i]) <= (tf_sec * 1000 + 180_000)
+            fresh = ind["tc"][i] >= last_close_ms - 1000  # the newest closed candle is really in the data
             self.data[sym] = {"ind": ind, "r4": r4, "sig": sig, "updated": now, "fresh": fresh}
+
+    def stale_symbols(self):
+        """Symbols whose newest closed candle has not arrived (network trouble or a late kline)."""
+        return [s for s in self.symbols() if not (self.data.get(s) or {}).get("fresh")]
 
     # ------------------------------------------------------------ main step
     def mark_symbols(self):
@@ -376,12 +400,31 @@ class Trader:
         if last_closed_ms > int(self.state.get("last_candle") or 0) and now - cur_open >= 5:
             self.state["last_candle"] = last_closed_ms
             self.on_candle(now, allow_entries=(now - cur_open) <= 600)
+            self.candle_retry = {"candle": last_closed_ms, "next": now + 30}
+        elif self.candle_retry:
+            self.retry_candle(now, cur_open)
         self.spot_step(now)
         if self.state.get("hist_day") != utc_day(now):
             self.record_daily(now)  # one total-equity row per UTC day, with or without the spot sleeve
         self.briefs(now)
         self.monthly(now)
         self.save()
+
+    def retry_candle(self, now, cur_open):
+        """A candle close is judged once. Symbols whose candle was missing then (failed or late klines) get
+        another look every 30 s for the rest of the 10-minute entry window instead of waiting a whole candle."""
+        r = self.candle_retry
+        stale = self.stale_symbols() if r["candle"] == int(self.state.get("last_candle") or 0) else []
+        if not stale:
+            self.candle_retry = None
+        elif now - cur_open > 600:
+            self.candle_retry = None
+            self.alert("stale_candle", f"⚠️ {', '.join(short(x) for x in stale)}: 캔들 데이터를 받지 못해 이번 "
+                       f"{self.cfg['signal_tf']} 봉 판단을 건너뜁니다. 보유 포지션의 거래소 손절은 그대로 유지됩니다.",
+                       every=6 * 3600)
+        elif now >= r["next"]:
+            r["next"] = now + 30
+            self.on_candle(now, allow_entries=True, only=set(stale))
 
     def track_equity(self, now):
         eq = self.broker.equity()
@@ -704,12 +747,26 @@ class Trader:
                 self.finalize(sym, pos)
                 continue
             qty = abs(e["amt"])
+            m = self.marks.get(sym) or e["mark"]
+            if qty > pos["qty"] + 1e-12:
+                # an add whose answer was lost has landed after all (or the user added in the app): take the
+                # exchange's average entry and count it as an add, so the same step is not bought twice
+                grown = qty - pos["qty"]
+                ref = m or e["entry"] or pos["entry"]
+                gap = (ref - pos["stop"]) if pos["side"] == S.LONG else (pos["stop"] - ref)
+                pos["risk_amt"] = float(pos.get("risk_amt") or 0.0) + grown * max(gap, 0.0)
+                pos["entry"] = e["entry"] or pos["entry"]
+                pos["adds"] = int(pos.get("adds", 0) or 0) + 1
+                pos["last_add_px"] = ref
             if abs(qty - pos["qty"]) > 1e-12:
                 pos["qty"] = qty
-            m = self.marks.get(sym) or e["mark"]
             pos["mark"] = m
             pos["upnl"] = e["upnl"]
             pos["liq"] = e.get("liq", 0.0)
+            if pos["liq"] > 0 and ((pos["side"] == S.LONG and pos["liq"] >= pos["stop"]) or
+                                   (pos["side"] == S.SHORT and pos["liq"] <= pos["stop"])):
+                self.alert(f"liq_{sym}", f"⚠️ {short(sym)}: 청산가 {px(pos['liq'])}가 손절가 {px(pos['stop'])}보다 먼저 닿는 "
+                           "위치입니다. 앱에서 증거금을 추가하거나 /close 로 정리해 주세요.", every=3600)
             if m:
                 pos["extreme"] = max(pos["extreme"], m) if pos["side"] == S.LONG else min(pos["extreme"], m)
             if not self.ensure_stop(sym, pos):
@@ -802,7 +859,7 @@ class Trader:
         self.exit_position(sym, "NO_STOP")
         return False
 
-    def replace_stop(self, sym, pos, new_trigger, note=True):
+    def replace_stop(self, sym, pos, new_trigger, note=True, resize=False):
         close_side = "SELL" if pos["side"] == S.LONG else "BUY"
         old_id, old_stop = pos.get("stop_id"), pos["stop"]
         try:
@@ -821,6 +878,8 @@ class Trader:
         if old_id and old_id != sid:
             self.broker.cancel_stop(sym, old_id)
         self.save()
+        if resize:  # same trigger, new quantity (after an add-on)
+            return True
         self.event("TRAIL", sym=sym, old=old_stop, new=new_trigger)
         locked = (pos["side"] == S.LONG and new_trigger > pos["entry"]) or \
                  (pos["side"] == S.SHORT and new_trigger < pos["entry"])
@@ -851,11 +910,11 @@ class Trader:
         self.replace_stop(sym, pos, cand)
 
     # ------------------------------------------------------------ candle close
-    def on_candle(self, now, allow_entries=True):
-        self.refresh_data()
+    def on_candle(self, now, allow_entries=True, only=None):
+        self.refresh_data(only)
         for sym, pos in list(self.positions.items()):
             d = self.data.get(sym)
-            if not d:
+            if not d or (only is not None and sym not in only):
                 continue
             ind = d["ind"]
             i = len(ind["c"]) - 1
@@ -874,12 +933,70 @@ class Trader:
                 continue
             self.maybe_trail(sym, pos, force=True)
         if allow_entries:
-            self.try_entries(now)
+            self.try_addons(now, only)
+            self.try_entries(now, only)
         self.save()
 
-    def try_entries(self, now):
+    def try_addons(self, now, only=None):
+        """Pyramiding: on a fresh candle close, add one unit to each winner that qualifies (strategy.addon_due)."""
+        if int(self.cfg.get("pyramid_max_adds", 0) or 0) <= 0:
+            return
+        for sym, pos in list(self.positions.items()):
+            d = self.data.get(sym)
+            if not d or not d.get("fresh") or (only is not None and sym not in only):
+                continue
+            candle = d["ind"]["tc"][-1]
+            if pos.get("add_candle") == candle or sym not in self.filters or not pos.get("lev"):
+                continue
+            if S.addon_due(pos, d["ind"]["c"][-1], self.cfg):
+                self.add_unit(sym, pos, candle, now)
+
+    def add_unit(self, sym, pos, candle, now):
+        side = pos["side"]
+        eq = self.broker.equity()
+        ok, code = R.can_add(self.ledger, now, eq["equity"], self.cfg, paused=self.state.get("paused"),
+                             blocked=bool(self.state.get("blocked")))
+        mark = self.marks.get(sym) or pos.get("mark") or pos["entry"]
+        sz = R.size_addon(eq["equity"], eq["available"], pos, mark, self.cfg, self.filters[sym]) if ok \
+            else {"ok": False, "code": code}
+        if not sz["ok"]:
+            self.event("SKIP", sym=sym, side=side, code=sz["code"], add=True)
+            return False
+        # one attempt per candle, written down BEFORE the order: an add with an unknown outcome is never re-sent
+        pos["add_candle"] = candle
+        self.save()
+        try:
+            fill = self.broker.market(sym, "BUY" if side == S.LONG else "SELL", sz["qty"], tag="A")
+        except (BinanceError, NetworkError) as e:
+            self.alert(f"add_{sym}", f"⚠️ {short(sym)} 추가 진입 주문 실패: {e}\n기존 포지션과 손절은 그대로입니다.", every=600)
+            self.event("ERROR", where="add", sym=sym, msg=str(e))
+            return False
+        if fill["qty"] <= 0 or fill["avg"] <= 0:
+            return False
+        old_qty = pos["qty"]
+        pos["entry"] = (pos["entry"] * old_qty + fill["avg"] * fill["qty"]) / (old_qty + fill["qty"])
+        pos["qty"] = old_qty + fill["qty"]
+        pos["adds"] = int(pos.get("adds", 0) or 0) + 1
+        pos["last_add_px"] = fill["avg"]
+        gap = (fill["avg"] - pos["stop"]) if side == S.LONG else (pos["stop"] - fill["avg"])
+        pos["risk_amt"] = float(pos.get("risk_amt") or 0.0) + fill["qty"] * max(gap, 0.0)
+        pos["locked_notified"] = False
+        self.save()
+        self.event("ADD", sym=sym, side=side, qty=fill["qty"], entry=fill["avg"], n=pos["adds"])
+        if not self.replace_stop(sym, pos, pos["stop"], resize=True):  # the stop must cover the whole position
+            if sym not in self.positions:
+                return True  # price was already through the stop: the position was closed instead
+            self.log.warning("stop resize after add %s failed — the next check repairs it", sym)
+        at_stop = ((pos["stop"] - pos["entry"]) if side == S.LONG else (pos["entry"] - pos["stop"])) * pos["qty"]
+        self.send(f"➕ 불타기 {pos['adds']}/{int(self.cfg['pyramid_max_adds'])} — {short(sym)} {SIDE_KO[side]}\n"
+                  f"추가 {fill['qty']:g} @ {px(fill['avg'])} | 평균 진입가 {px(pos['entry'])} · 총 수량 {pos['qty']:g}\n"
+                  f"손절 {px(pos['stop'])} (전체 수량에 다시 걸어둠) | 지금 손절되면 {usd(at_stop)} (수수료 전)")
+        return True
+
+    def try_entries(self, now, only=None):
         cands = [(sym, d["sig"]) for sym, d in self.data.items()
-                 if d.get("fresh") and d["sig"].get("side") and sym not in self.positions]
+                 if d.get("fresh") and d["sig"].get("side") and sym not in self.positions
+                 and (only is None or sym in only)]
         cands.sort(key=lambda x: -x[1].get("strength", 0))
         for sym, sig in cands:
             eq = self.broker.equity()
@@ -917,7 +1034,7 @@ class Trader:
             "r_dist": dist, "atr": sig["atr"], "atr_now": sig["atr"], "opened_ms": self.now_ms(),
             "extreme": entry, "stop_id": None, "stop_set_ms": 0, "lev": sz["lev"],
             "risk_amt": fill["qty"] * dist, "reason": sig["code"], "breach": 0,
-            "entry_order_id": fill.get("order_id"),
+            "entry_order_id": fill.get("order_id"), "adds": 0, "last_add_px": entry,
             "signal": {"regime": sig["regime"], "adx": round(sig["adx"], 1), "rsi": round(sig["rsi"], 1)},
         }
         self.positions[sym] = pos
@@ -1001,7 +1118,8 @@ class Trader:
         rec = {"ts": now, "mode": self.state["mode"], "sym": sym, "side": pos["side"], "qty": pos["qty"],
                "entry": pos["entry"], "exit": exit_px, "pnl": round(pnl, 6), "fee": round(r["fee"], 6),
                "funding": round(r["funding"], 6), "r": round(rmult, 3), "reason": reason,
-               "opened_ms": pos["opened_ms"], "hours": round(hours, 2), "lev": pos.get("lev")}
+               "opened_ms": pos["opened_ms"], "hours": round(hours, 2), "lev": pos.get("lev"),
+               "adds": int(pos.get("adds", 0) or 0)}
         self.store.append("journal.jsonl", rec)
         self.positions.pop(sym, None)
         self.state.setdefault("last_close_ms", {})[sym] = self.now_ms()
@@ -1165,6 +1283,8 @@ class Trader:
             rnow = upnl / p["risk_amt"] if p.get("risk_amt") else 0
             stop_pct = (p["stop"] - p["entry"]) / p["entry"] * 100 * (1 if p["side"] == S.LONG else -1)
             lev = f" x{p['lev']}" if p.get("lev") else ""
+            if p.get("adds"):
+                lev += f" · 불타기 {p['adds']}회"
             out.append(f"{SIDE_ICON[p['side']]} {short(sym)} {SIDE_KO[p['side']]}{lev} | {px(p['entry'])} → {px(m)} ({chg:+.2f}%)")
             out.append(f"   손절 {px(p['stop'])} ({stop_pct:+.2f}%) | 미실현 {usd(upnl)} ({rnow:+.2f}R)")
         return out
@@ -1243,7 +1363,7 @@ class Trader:
         self.send(
             f"🤖 {self.cfg['bot_name']} 명령어\n"
             "📊 /status 상태·보유 포지션\n💰 /pnl 손익 성과\n🪙 /spot 현물 보유·목표 비중\n"
-            "⚖️ /alloc 현물/선물 배분 (/alloc 50 = 현물 50%)\n🎚 /preset 안정·기본·공격 위험 단계\n"
+            "⚖️ /alloc 현물/선물 배분 (/alloc 50 = 현물 50%)\n🎚 /preset 안정·기본·공격 위험 단계(불타기 포함)\n"
             "🔎 /scan 선물 종목별 신호 상태\n📜 /log 최근 판단 기록\n📁 /export 거래기록 CSV(세금 신고용)\n"
             "📅 /report 지난달 리포트 (/report 이번달) — 매월 1일 자동 발송\n"
             "⏸ /pause 신규 진입 정지 · ▶️ /resume 재개\n"
@@ -1373,27 +1493,30 @@ class Trader:
 
     def cmd_preset(self, args):
         cur = (float(self.cfg.get("alloc_spot_pct", 50)), float(self.cfg["risk_per_trade_pct"]),
-               float(self.cfg.get("spot_vol_target", 0.6)))
+               float(self.cfg.get("spot_vol_target", 0.6)), int(self.cfg.get("pyramid_max_adds", 0) or 0))
         if not args or args[0] not in PRESETS:
-            lines = ["🎚 위험 단계 (백테스트 2020~2026, 수수료·실제 펀딩비 포함)"]
-            for k, (sp, rk, vt) in PRESETS.items():
-                mark = " ← 현재" if cur == (sp, rk, vt) else ""
-                lines.append(f"{k}: 현물 {sp}% / 선물 {100 - sp}% · 선물 1회 위험 {rk:g}% — {PRESET_NOTE[k]}{mark}")
-            lines.append("변경: /preset 기본   (과거 수치는 미래를 보장하지 않습니다)")
+            lines = ["🎚 위험 단계 (백테스트 2020~2026, 수수료 포함·펀딩비 8시간 0.03% 가정)"]
+            for k, (sp, rk, vt, adds) in PRESETS.items():
+                mark = " ← 현재" if cur == (sp, rk, vt, adds) else ""
+                lines.append(f"{k}: 현물 {sp}% / 선물 {100 - sp}% · 선물 1회 위험 {rk:g}% · 불타기 {adds}회 — "
+                             f"{PRESET_NOTE[k]}{mark}")
+            lines.append("불타기 = 손절이 평균 진입가 위로 올라와 손실 위험이 없어진 포지션에만, 가격이 더 오르면 추가 진입.")
+            lines.append("변경: /preset 기본   (과거 수치는 미래를 보장하지 않습니다. 최근 2025~26년은 과거 평균보다 훨씬 약했습니다)")
             self.send("\n".join(lines))
             return
         name = args[0]
-        sp, rk, vt = PRESETS[name]
-        self.confirm(f"'{name}' 단계로 바꿀까요?\n현물 {sp}% : 선물 {100 - sp}% · 선물 1회 위험 {rk:g}% · 현물 변동성 목표 {vt:g}\n"
-                     f"{PRESET_NOTE[name]}", "preset", name)
+        sp, rk, vt, adds = PRESETS[name]
+        self.confirm(f"'{name}' 단계로 바꿀까요?\n현물 {sp}% : 선물 {100 - sp}% · 선물 1회 위험 {rk:g}% · 불타기 {adds}회 · "
+                     f"현물 변동성 목표 {vt:g}\n{PRESET_NOTE[name]}", "preset", name)
 
     def act_preset(self, name):
-        sp, rk, vt = PRESETS[name]
+        sp, rk, vt, adds = PRESETS[name]
         self._save_setting("alloc_spot_pct", float(sp))
         self._save_setting("risk_per_trade_pct", float(rk))
         self._save_setting("spot_vol_target", float(vt))
+        self._save_setting("pyramid_max_adds", int(adds))
         self.force_rebalance()
-        self.send(f"✅ '{name}' 단계 적용 — 현물 {sp}% : 선물 {100 - sp}%, 선물 1회 위험 {rk:g}%. 곧 배분을 맞춥니다.")
+        self.send(f"✅ '{name}' 단계 적용 — 현물 {sp}% : 선물 {100 - sp}%, 선물 1회 위험 {rk:g}%, 불타기 {adds}회. 곧 배분을 맞춥니다.")
 
     def _save_setting(self, key, val):
         settings = self.store.load_settings()
@@ -1500,9 +1623,12 @@ class Trader:
             elif k == "EXIT":
                 out.append(f"{t} 청산 {sym} {usd(e.get('pnl', 0))} ({e.get('r', 0):+.1f}R) {EXIT_KO.get(e.get('reason'), e.get('reason'))}")
             elif k == "SKIP":
-                out.append(f"{t} 패스 {sym} {SIDE_KO.get(e.get('side'), '')}: {R.GUARD_KO.get(e.get('code'), e.get('code'))}")
+                what = "불타기 패스" if e.get("add") else "패스"
+                out.append(f"{t} {what} {sym} {SIDE_KO.get(e.get('side'), '')}: {R.GUARD_KO.get(e.get('code'), e.get('code'))}")
             elif k == "TRAIL":
                 out.append(f"{t} 손절이동 {sym} {px(e.get('old'))}→{px(e.get('new'))}")
+            elif k == "ADD":
+                out.append(f"{t} 불타기 {sym} {SIDE_KO.get(e.get('side'), '')} {e.get('n')}회차 @{px(e.get('entry'))}")
             elif k == "GUARD":
                 out.append(f"{t} 가드 {R.GUARD_KO.get(e.get('code'), e.get('code'))}")
             elif k == "ERROR":
@@ -1514,7 +1640,7 @@ class Trader:
     def cmd_pause(self, args):
         self.state["paused"] = True
         self.save()
-        self.send("⏸ 신규 진입을 멈췄습니다. 보유 포지션 관리(손절·추적)는 계속합니다. 재개: /resume")
+        self.send("⏸ 신규 진입과 불타기를 멈췄습니다. 보유 포지션 관리(손절·추적)는 계속합니다. 재개: /resume")
 
     def cmd_resume(self, args):
         self.state["paused"] = False
@@ -1562,6 +1688,7 @@ class Trader:
         keys = ["spot_enabled", "alloc_spot_pct", "alloc_band_pct", "spot_candidates", "spot_universe_size",
                 "spot_vol_target", "spot_band_pct", "spot_btc_gate", "spot_btc_gate_min", "spot_earn", "spot_cash_yield",
                 "symbols", "signal_tf", "trend_tf", "allow_long", "allow_short", "risk_per_trade_pct", "max_leverage", "max_open_positions", "max_same_direction",
+                "pyramid_max_adds", "pyramid_step_r", "pyramid_risk_frac", "liq_buffer_mult",
                 "max_entries_per_day", "daily_loss_limit_pct", "loss_streak_limit", "loss_streak_pause_hours",
                 "cooldown_after_loss_hours", "equity_floor_pct", "time_stop_hours", "adx_min",
                 "brief_morning_kst", "brief_evening_kst", "monthly_report", "update_url"]
@@ -2008,9 +2135,17 @@ def check(data_dir):
     cfg = load_config(APP_DIR, store)
     for key in ("symbols", "signal_tf", "trend_tf", "risk_per_trade_pct", "ma_periods",
                 "spot_candidates", "spot_lookbacks", "spot_vol_target", "alloc_spot_pct", "monthly_report",
-                "spot_btc_gate", "spot_btc_gate_min", "spot_earn", "spot_cash_yield"):
+                "spot_btc_gate", "spot_btc_gate_min", "spot_earn", "spot_cash_yield",
+                "pyramid_max_adds", "pyramid_step_r", "pyramid_risk_frac", "liq_buffer_mult"):
         if key not in cfg:
             raise SystemExit(f"config missing {key}")
+    for key, lo, hi in (("pyramid_max_adds", 0, 3), ("pyramid_step_r", 0.5, 5.0), ("pyramid_risk_frac", 0.1, 1.0),
+                        ("liq_buffer_mult", 0.0, 5.0)):
+        v = cfg[key]
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not lo <= v <= hi:
+            raise SystemExit(f"bad {key} ({lo}~{hi})")
+    if cfg["pyramid_max_adds"] != int(cfg["pyramid_max_adds"]):
+        raise SystemExit("bad pyramid_max_adds (whole number)")
     if not 0 <= float(cfg["alloc_spot_pct"]) <= 100:
         raise SystemExit("bad alloc_spot_pct")
     if not isinstance(cfg["monthly_report"], bool):
