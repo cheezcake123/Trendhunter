@@ -98,20 +98,29 @@ class AddonRules(unittest.TestCase):
         self.assertAlmostEqual(sz["risk_amt"], 5.0)   # so the real risk is smaller than the target
 
     def test_margin_budget_covers_the_whole_pyramid(self):
-        sz = R.size_addon(1000, 1000, long_pos(qty=28.0), 106.0, PYR, F)  # 280 of the 300 budget already posted
-        self.assertTrue(sz["capped"])
-        self.assertLessEqual(28.0 * 100 / 10 + sz["margin"], 300.0 + 1e-6)
-        poor = R.size_addon(1000, 10, long_pos(), 106.0, PYR, F)
-        self.assertLessEqual(poor["margin"], 9.5 + 1e-6)
+        sz = R.size_addon(1000, 1000, long_pos(qty=27.0), 106.0, PYR, F)  # 270 of the 300 budget already posted
+        self.assertTrue(sz["ok"] and sz["capped"])                        # wants 42.4 of margin, gets 30
+        self.assertLessEqual(27.0 * 100 / 10 + sz["margin"], 300.0 + 1e-6)
+        self.assertGreater(sz["margin"], 29.0)
+        poor = R.size_addon(1000, 30, long_pos(), 106.0, PYR, F)          # only 30 free in the wallet
+        self.assertTrue(poor["ok"])
+        self.assertLessEqual(poor["margin"], 30 * 0.95 + 1e-6)
         self.assertEqual(R.size_addon(1000, 1000, long_pos(qty=30.0), 106.0, PYR, F)["code"], "NO_MARGIN")
+        # a token add (less than half the intended unit) is refused instead of using up a pyramid slot
+        self.assertEqual(R.size_addon(1000, 1000, long_pos(qty=29.0), 106.0, PYR, F)["code"], "NO_MARGIN")
+        self.assertEqual(R.size_addon(1000, 10, long_pos(), 106.0, PYR, F)["code"], "NO_MARGIN")
 
     def test_liquidation_stays_beyond_the_stop(self):
-        pos = long_pos(stop=100.0)
-        sz = R.size_addon(10000, 10000, pos, 130.0, PYR, F)  # a wide trail far above the average entry
+        pos = long_pos(qty=15.0, stop=100.0)
+        sz = R.size_addon(10000, 10000, pos, 110.0, PYR, F)  # wants 20 units; the trail is 10% under the price
         self.assertTrue(sz["ok"] and sz["capped"])
-        avg = (pos["qty"] * pos["entry"] + sz["qty"] * 130.0) / (pos["qty"] + sz["qty"])
+        self.assertLess(sz["qty"], 20.0)
+        avg = (pos["qty"] * pos["entry"] + sz["qty"] * 110.0) / (pos["qty"] + sz["qty"])
         allowed = (1.0 / pos["lev"] - R.MMR) / 2.0
         self.assertLessEqual((avg - pos["stop"]) / avg, allowed + 1e-9)
+        self.assertGreater((avg - pos["stop"]) / avg, allowed * 0.99, "the cap is used fully, not over-tightened")
+        # squeezed below half the intended size: not worth a pyramid slot
+        self.assertEqual(R.size_addon(10000, 10000, long_pos(stop=100.0), 130.0, PYR, F)["code"], "LIQ_TOO_CLOSE")
         self.assertEqual(R.size_addon(1000, 1000, long_pos(stop=90.0), 106.0, PYR, F)["code"], "LIQ_TOO_CLOSE")
 
     def test_refusals(self):
@@ -242,7 +251,7 @@ class LiveAdds(unittest.TestCase):
         tr.try_addons(self.clock())
         self.assertEqual(len(self.orders()), 1)
 
-    def test_no_add_when_switched_off_paused_or_legacy_position(self):
+    def test_no_add_when_switched_off_paused_or_leverage_unknown(self):
         tr, tg, store = self.started(over={"pyramid_max_adds": 0})
         pos = self.winner(tr)
         tr.try_addons(self.clock())
@@ -256,6 +265,114 @@ class LiveAdds(unittest.TestCase):
         pos["lev"] = None  # adopted / unknown leverage: never pyramided
         tr.try_addons(self.clock())
         self.assertEqual(len(self.orders()), 1)
+
+    def test_v23_position_at_its_margin_cap_gets_no_token_add(self):
+        tr, tg, store = self.started(over={"liq_buffer_mult": 0})  # entered under the old leverage rule
+        pos = self.winner(tr)
+        self.assertLessEqual(pos["lev"], 5)
+        tr.cfg["liq_buffer_mult"] = 2.0  # then the bot was updated
+        tr.try_addons(self.clock())
+        self.assertEqual(len(self.orders()), 1, "a sliver of an add would only burn a pyramid slot and fees")
+        self.assertTrue(any(e.get("add") and e.get("code") == "NO_MARGIN" for e in store.read_all("events.jsonl")))
+
+    def test_no_add_to_a_position_that_is_already_closed(self):
+        tr, tg, store = self.started()
+        pos = self.winner(tr)
+        real = tr.broker.realized
+
+        def down(*a, **k):
+            raise NetworkError("trade history unavailable")
+
+        tr.broker.realized = down
+        self.assertTrue(tr.exit_position(self.SYM, "TRAIL"))
+        self.assertIn(self.SYM, tr.positions, "booking waits while the trade history cannot be read")
+        self.assertEqual(self.fake.positions, {})
+        n = len(self.orders())
+        tr.try_addons(self.clock())
+        self.assertEqual(len(self.orders()), n, "an add was sent for a position that is already closed")
+        self.assertEqual(self.fake.positions, {})
+        tr.broker.realized = real
+        self.clock.advance(20)
+        tr.step()
+        self.assertNotIn(self.SYM, tr.positions)
+        self.assertEqual(self.fake.open_algos(), [])
+
+    def test_no_add_when_the_exchange_disagrees_with_the_books(self):
+        tr, tg, store = self.started()
+        pos = self.winner(tr)
+        # the exchange stop fills between two checks; the bot has not looked yet
+        self.fake._fill(self.SYM, "SELL", abs(self.fake.positions[self.SYM]["amt"]), pos["stop"],
+                        int(self.clock() * 1000), reduce_only=True)
+        n = len(self.orders())
+        tr.try_addons(self.clock())
+        self.assertEqual(len(self.orders()), n)
+        self.assertEqual(self.fake.positions, {})
+        self.assertTrue(any(e.get("code") == "OUT_OF_SYNC" for e in store.read_all("events.jsonl")))
+
+    def test_stop_that_cannot_be_resized_means_the_add_is_taken_back(self):
+        tr, tg, store = self.started()
+        w0 = self.fake.wallet
+        pos = self.winner(tr)
+        q0 = pos["qty"]
+        self.fake.reject_algo = True
+        tr.try_addons(self.clock())
+        self.fake.reject_algo = False
+        self.assertEqual(len(self.orders()), 3, "entry, add, and the add sold again")
+        self.assertAlmostEqual(abs(self.fake.positions[self.SYM]["amt"]), q0, places=9)
+        self.assertAlmostEqual(pos["qty"], q0, places=9)
+        self.assert_one_full_stop(tr)
+        self.assertTrue(any("다시 정리했습니다" in t for t in tg.texts()))
+        self.assertFalse(any("전체 수량에 다시 걸어둠" in t for t in tg.texts()), "must not claim a stop that is not there")
+        tr.act_closeall()
+        booked = sum(j["pnl"] for j in store.read_all("journal.jsonl"))
+        self.assertAlmostEqual(self.fake.wallet - w0, booked, delta=0.01)
+
+    def test_float_noise_in_a_large_quantity_is_not_growth(self):
+        tr, tg, store = self.started()
+        pos = self.winner(tr)
+        pos["qty"] -= 5e-12  # books 46564.799999999996 vs exchange 46564.8: a float sum, not a bigger position
+        ref = pos["last_add_px"]
+        self.clock.advance(20)
+        tr.step()
+        self.assertEqual(pos.get("adds", 0), 0, "float noise used up a pyramid slot")
+        self.assertEqual(pos["last_add_px"], ref)
+        self.assertEqual(len(self.orders()), 1)
+
+    def test_manual_top_up_is_adopted_but_is_not_a_pyramid_step(self):
+        tr, tg, store = self.started()
+        pos = self.winner(tr)
+        q0 = pos["qty"]
+        self.fake._fill(self.SYM, "BUY", 0.05, self.fake.price(self.SYM), int(self.clock() * 1000))
+        self.clock.advance(20)
+        tr.step()
+        self.assertAlmostEqual(pos["qty"], q0 + 0.05, places=9)
+        self.assertEqual(pos.get("adds", 0), 0)
+        self.assertAlmostEqual(pos["entry"], self.fake.positions[self.SYM]["entry"])
+        self.assert_one_full_stop(tr)
+        self.assertTrue(any("늘어나" in t for t in tg.texts()))
+        self.assertFalse(any(e["kind"] == "TRAIL" and e.get("old") == e.get("new")
+                             for e in store.read_all("events.jsonl")), "a resize is not a trailing move")
+
+    def test_add_that_never_reached_the_exchange_can_be_tried_on_the_next_candle(self):
+        tr, tg, store = self.started()
+        pos = self.winner(tr)
+        real = tr.broker.market
+
+        def lost(*a, **k):
+            raise NetworkError("the request never left")
+
+        tr.broker.market = lost
+        tr.try_addons(self.clock())
+        self.assertTrue(pos.get("add_pending"))
+        tr.broker.market = real
+        tr.try_addons(self.clock())
+        self.assertEqual(len(self.orders()), 1, "same candle: no second attempt")
+        self.clock.advance((int(self.clock() // TF) + 1) * TF - self.clock() + 10)  # the next 4h close
+        tr.step()
+        self.assertEqual(len(self.orders()), 2)
+        self.assertEqual(pos["adds"], 1)
+        self.assertNotIn("add_pending", pos)
+        self.assert_one_full_stop(tr)
 
     def test_add_with_unknown_outcome_is_never_sent_twice(self):
         tr, tg, store = self.started()
@@ -274,8 +391,10 @@ class LiveAdds(unittest.TestCase):
         tr.step()  # reconcile: the exchange shows the bigger position
         self.assertGreater(pos["qty"], q0)
         self.assertEqual(pos["adds"], 1)
+        self.assertNotIn("add_pending", pos)
         self.assertAlmostEqual(pos["entry"], self.fake.positions[self.SYM]["entry"])
         self.assert_one_full_stop(tr)
+        self.assertTrue(any("응답을 받지 못했던 추가 진입" in t for t in tg.texts()))
         tr.try_addons(self.clock())
         self.assertEqual(len(self.orders()), 2)
 
@@ -392,6 +511,53 @@ class CandleRetry(unittest.TestCase):
         self.assertIsNone(tr.candle_retry)
         self.assertEqual(len(self.seen), 2)
 
+    def test_entry_happens_on_the_retry_and_only_once(self):
+        tr = self.tr
+        self.break_klines("down")
+        tr.step()
+        self.assertNotIn("AAAUSDT", tr.positions)
+        tr.api.klines = self.real
+        refresh = tr.refresh_data
+
+        def with_signal(only=None):  # the candle that was missing carries a breakout
+            refresh(only)
+            if (tr.data.get("AAAUSDT") or {}).get("fresh"):
+                tr.data["AAAUSDT"]["sig"] = fake_signal(tr, "AAAUSDT")
+
+        tr.refresh_data = with_signal
+        for _ in range(6):
+            self.clock.advance(20)
+            tr.step()
+        self.assertIn("AAAUSDT", tr.positions, "the breakout was taken 40 s late instead of being lost")
+        self.assertEqual(len([o for o in self.fake.orders.values() if o["symbol"] == "AAAUSDT"]), 1)
+        self.assertEqual(len(self.fake.open_algos("AAAUSDT")), 1)
+
+    def test_a_judged_symbol_gets_no_second_look_when_its_data_goes_missing_later(self):
+        tr = self.tr
+        tr.step()  # all symbols judged at the close
+        self.assertEqual(self.seen, [None])
+        self.break_klines("down")
+        tr.refresh_data()  # e.g. /set symbols during a network hiccup
+        self.assertEqual(tr.stale_symbols(), ["AAAUSDT"])
+        tr.api.klines = self.real
+        for _ in range(4):
+            self.clock.advance(20)
+            tr.step()
+        self.assertEqual(self.seen, [None], "entries were judged twice for the same candle")
+
+    def test_halted_or_young_symbols_are_not_retried_forever(self):
+        tr = self.tr
+        tr.filters["AAAUSDT"]["status"] = "BREAK"
+        self.break_klines("late")
+        tr.step()
+        self.assertEqual(tr.stale_symbols(), [])
+        tr.filters["AAAUSDT"]["status"] = "TRADING"
+        tr.api.klines = lambda sym, interval, **kw: \
+            self.real(sym, interval, **kw)[-30:] if sym == "AAAUSDT" else self.real(sym, interval, **kw)
+        tr.refresh_data()
+        self.assertNotIn("AAAUSDT", tr.data)  # too young for the indicators: no data, but no failed download either
+        self.assertEqual(tr.stale_symbols(), [])
+
     def test_late_candle_is_not_mistaken_for_the_new_one(self):
         tr = self.tr
         self.break_klines("late")
@@ -438,6 +604,7 @@ class PyramidScenario(TLF.LiveScenario):
     def test_downtrend_shorts(self):
         tr, tg, store, fake, journal = self.run_scenario(-1, over={"allow_short": True, "pyramid_max_adds": 2})
         self.assertTrue(any(j["side"] == S.SHORT for j in journal))
+        self.assertGreaterEqual(sum(j.get("adds", 0) for j in journal), 1, "expected add-ons to short winners too")
         print(f"\n[downtrend+pyramid] trades={len(journal)} adds={sum(j.get('adds', 0) for j in journal)} "
               f"pnl={sum(j['pnl'] for j in journal):+.2f}")
 

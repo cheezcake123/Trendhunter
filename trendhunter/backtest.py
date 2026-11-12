@@ -241,7 +241,7 @@ def simulate(cfg, pre, start_ms, risk_pct=None, start_equity=100.0, filters=None
                 ok, code = R.can_add(L, now_s, eq, p)
                 c = pre[sym]["ind"]["c"][i]
                 px_in = c * (1 + slip if q["side"] == S.LONG else 1 - slip)
-                sz = R.size_addon(eq, eq - sum(x["margin"] for x in pos.values()), q, px_in, p,
+                sz = R.size_addon(eq, cash - sum(x["margin"] for x in pos.values()), q, px_in, p,
                                   (filters or {}).get(sym)) if ok else {"ok": False, "code": code}
                 if not sz["ok"]:
                     skips["ADD_" + sz["code"]] = skips.get("ADD_" + sz["code"], 0) + 1
@@ -274,7 +274,7 @@ def simulate(cfg, pre, start_ms, risk_pct=None, start_equity=100.0, filters=None
             entry = sig["close"] * (1 + slip if side == S.LONG else 1 - slip)
             stop, dist = S.initial_stop(side, entry, sig["atr"], p)
             used = sum(q["margin"] for q in pos.values())
-            sz = R.size_position(eq, eq - used, entry, dist, p, (filters or {}).get(sym))
+            sz = R.size_position(eq, cash - used, entry, dist, p, (filters or {}).get(sym))
             if not sz["ok"]:
                 skips[sz["code"]] = skips.get(sz["code"], 0) + 1
                 continue

@@ -221,6 +221,7 @@ class Trader:
         self.err_alerted = False
         self.last_alert = {}
         self.candle_retry = None
+        self.fetch_failed = set()  # symbols whose last klines call failed
 
     # ------------------------------------------------------------ basics
     @property
@@ -364,7 +365,9 @@ class Trader:
             except (BinanceError, NetworkError) as e:
                 self.log.warning("klines %s: %s", sym, e)
                 self.data.pop(sym, None)
+                self.fetch_failed.add(sym)
                 continue
+            self.fetch_failed.discard(sym)
             c1 = S.candles_from_klines(raw1, now_ms)
             c4 = S.candles_from_klines(raw4, now_ms)
             if len(c1["c"]) < 60 or not c4["c"]:
@@ -379,8 +382,19 @@ class Trader:
             self.data[sym] = {"ind": ind, "r4": r4, "sig": sig, "updated": now, "fresh": fresh}
 
     def stale_symbols(self):
-        """Symbols whose newest closed candle has not arrived (network trouble or a late kline)."""
-        return [s for s in self.symbols() if not (self.data.get(s) or {}).get("fresh")]
+        """Symbols whose newest closed candle did not arrive: the klines call failed, or it answered without the
+        candle that just closed. A symbol that is not trading or too young for the indicators is not 'stale'."""
+        out = []
+        for s in self.symbols():
+            if self.filters.get(s, {}).get("status", "TRADING") != "TRADING":
+                continue
+            d = self.data.get(s)
+            if s in self.fetch_failed or (d is not None and not d.get("fresh")):
+                out.append(s)
+        return out
+
+    def fresh_symbols(self):
+        return {s for s, d in self.data.items() if d.get("fresh")}
 
     # ------------------------------------------------------------ main step
     def mark_symbols(self):
@@ -400,7 +414,8 @@ class Trader:
         if last_closed_ms > int(self.state.get("last_candle") or 0) and now - cur_open >= 5:
             self.state["last_candle"] = last_closed_ms
             self.on_candle(now, allow_entries=(now - cur_open) <= 600)
-            self.candle_retry = {"candle": last_closed_ms, "next": now + 30}
+            # "judged": every symbol gets ONE look at entries per candle, whatever refreshes the data later
+            self.candle_retry = {"candle": last_closed_ms, "next": now + 30, "judged": self.fresh_symbols()}
         elif self.candle_retry:
             self.retry_candle(now, cur_open)
         self.spot_step(now)
@@ -414,7 +429,8 @@ class Trader:
         """A candle close is judged once. Symbols whose candle was missing then (failed or late klines) get
         another look every 30 s for the rest of the 10-minute entry window instead of waiting a whole candle."""
         r = self.candle_retry
-        stale = self.stale_symbols() if r["candle"] == int(self.state.get("last_candle") or 0) else []
+        stale = [s for s in self.stale_symbols() if s not in r["judged"]] \
+            if r["candle"] == int(self.state.get("last_candle") or 0) else []
         if not stale:
             self.candle_retry = None
         elif now - cur_open > 600:
@@ -425,6 +441,7 @@ class Trader:
         elif now >= r["next"]:
             r["next"] = now + 30
             self.on_candle(now, allow_entries=True, only=set(stale))
+            r["judged"] |= self.fresh_symbols() & set(stale)
 
     def track_equity(self, now):
         eq = self.broker.equity()
@@ -748,16 +765,24 @@ class Trader:
                 continue
             qty = abs(e["amt"])
             m = self.marks.get(sym) or e["mark"]
-            if qty > pos["qty"] + 1e-12:
-                # an add whose answer was lost has landed after all (or the user added in the app): take the
-                # exchange's average entry and count it as an add, so the same step is not bought twice
+            if qty > pos["qty"] + float(self.filters.get(sym, R.DEFAULT_FILTER)["step"]) / 2:
+                # The position grew on the exchange by at least a lot step (not float noise): an add whose answer
+                # was lost has landed after all, the rest of a partly filled entry arrived, or the user added in
+                # the app. The exchange's average entry is the truth; ensure_stop below re-sizes the stop.
                 grown = qty - pos["qty"]
                 ref = m or e["entry"] or pos["entry"]
                 gap = (ref - pos["stop"]) if pos["side"] == S.LONG else (pos["stop"] - ref)
                 pos["risk_amt"] = float(pos.get("risk_amt") or 0.0) + grown * max(gap, 0.0)
                 pos["entry"] = e["entry"] or pos["entry"]
-                pos["adds"] = int(pos.get("adds", 0) or 0) + 1
-                pos["last_add_px"] = ref
+                if pos.pop("add_pending", None):  # only the bot's own unanswered add counts as a pyramid step
+                    pos["adds"] = int(pos.get("adds", 0) or 0) + 1
+                    pos["last_add_px"] = ref
+                    self.event("ADD", sym=sym, side=pos["side"], qty=grown, entry=ref, n=pos["adds"], late=True)
+                    self.send(f"➕ {short(sym)}: 응답을 받지 못했던 추가 진입이 체결돼 있어 반영했습니다 "
+                              f"(불타기 {pos['adds']}회차, 총 수량 {qty:g}). 손절을 전체 수량으로 다시 겁니다.")
+                else:
+                    self.alert(f"grown_{sym}", f"ℹ️ {short(sym)} 포지션 수량이 거래소에서 {pos['qty']:g} → {qty:g} 로 늘어나 "
+                               "있어 반영했습니다(앱에서 추가했거나 늦은 체결). 손절을 전체 수량으로 다시 겁니다.", every=600)
             if abs(qty - pos["qty"]) > 1e-12:
                 pos["qty"] = qty
             pos["mark"] = m
@@ -806,7 +831,11 @@ class Trader:
                 if s["id"] != pos["stop_id"]:
                     self.broker.cancel_stop(sym, s["id"])
             if not ours["close_position"] and abs(ours["qty"] - pos["qty"]) > 1e-9:
-                self.replace_stop(sym, pos, pos["stop"], note=False)
+                if not self.replace_stop(sym, pos, pos["stop"], resize=True) and sym in self.positions \
+                        and not pos.get("exit_reason"):
+                    self.alert(f"resize_{sym}", f"⚠️ {short(sym)}: 손절 주문 수량({ours['qty']:g})을 포지션 수량"
+                               f"({pos['qty']:g})에 맞추지 못했습니다. 20초마다 다시 시도합니다. 앱에서도 확인해 주세요.",
+                               every=600)
             return True
         if mine:
             # adopt the most protective stop that already exists, drop the rest
@@ -945,25 +974,39 @@ class Trader:
             d = self.data.get(sym)
             if not d or not d.get("fresh") or (only is not None and sym not in only):
                 continue
+            if pos.get("exit_reason") or pos.get("fin_tries"):
+                continue  # already closed or closing, only waiting to be booked: never add to that
             candle = d["ind"]["tc"][-1]
             if pos.get("add_candle") == candle or sym not in self.filters or not pos.get("lev"):
                 continue
+            pos.pop("add_pending", None)  # an add from an earlier candle has landed long ago, or never will
             if S.addon_due(pos, d["ind"]["c"][-1], self.cfg):
                 self.add_unit(sym, pos, candle, now)
 
     def add_unit(self, sym, pos, candle, now):
         side = pos["side"]
-        eq = self.broker.equity()
+        f = self.filters[sym]
+        try:
+            ex = self.broker.positions().get(sym)
+            eq = self.broker.equity()
+        except (BinanceError, NetworkError) as e:
+            self.log.warning("add %s: account lookup failed: %s", sym, e)
+            return False
+        # the exchange must show exactly the position the books say (not closed by its stop, not resized by hand)
+        if not ex or (ex["amt"] > 0) != (side == S.LONG) or abs(abs(ex["amt"]) - pos["qty"]) > float(f["step"]) / 2:
+            self.event("SKIP", sym=sym, side=side, code="OUT_OF_SYNC", add=True)
+            return False
         ok, code = R.can_add(self.ledger, now, eq["equity"], self.cfg, paused=self.state.get("paused"),
                              blocked=bool(self.state.get("blocked")))
         mark = self.marks.get(sym) or pos.get("mark") or pos["entry"]
-        sz = R.size_addon(eq["equity"], eq["available"], pos, mark, self.cfg, self.filters[sym]) if ok \
-            else {"ok": False, "code": code}
+        sz = R.size_addon(eq["equity"], eq["available"], pos, mark, self.cfg, f) if ok else {"ok": False, "code": code}
         if not sz["ok"]:
             self.event("SKIP", sym=sym, side=side, code=sz["code"], add=True)
             return False
-        # one attempt per candle, written down BEFORE the order: an add with an unknown outcome is never re-sent
+        # One attempt per candle, written down BEFORE the order: an add with an unknown outcome is never re-sent.
+        # add_pending tells reconcile that a quantity which grows on the exchange is this add landing late.
         pos["add_candle"] = candle
+        pos["add_pending"] = True
         self.save()
         try:
             fill = self.broker.market(sym, "BUY" if side == S.LONG else "SELL", sz["qty"], tag="A")
@@ -971,27 +1014,54 @@ class Trader:
             self.alert(f"add_{sym}", f"⚠️ {short(sym)} 추가 진입 주문 실패: {e}\n기존 포지션과 손절은 그대로입니다.", every=600)
             self.event("ERROR", where="add", sym=sym, msg=str(e))
             return False
+        pos.pop("add_pending", None)
         if fill["qty"] <= 0 or fill["avg"] <= 0:
+            self.save()
             return False
         old_qty = pos["qty"]
         pos["entry"] = (pos["entry"] * old_qty + fill["avg"] * fill["qty"]) / (old_qty + fill["qty"])
-        pos["qty"] = old_qty + fill["qty"]
+        pos["qty"] = R.round_step(old_qty + fill["qty"], f["step"])
         pos["adds"] = int(pos.get("adds", 0) or 0) + 1
         pos["last_add_px"] = fill["avg"]
         gap = (fill["avg"] - pos["stop"]) if side == S.LONG else (pos["stop"] - fill["avg"])
-        pos["risk_amt"] = float(pos.get("risk_amt") or 0.0) + fill["qty"] * max(gap, 0.0)
+        add_risk = fill["qty"] * max(gap, 0.0)
+        pos["risk_amt"] = float(pos.get("risk_amt") or 0.0) + add_risk
         pos["locked_notified"] = False
         self.save()
         self.event("ADD", sym=sym, side=side, qty=fill["qty"], entry=fill["avg"], n=pos["adds"])
-        if not self.replace_stop(sym, pos, pos["stop"], resize=True):  # the stop must cover the whole position
-            if sym not in self.positions:
-                return True  # price was already through the stop: the position was closed instead
-            self.log.warning("stop resize after add %s failed — the next check repairs it", sym)
+        for _ in range(3):  # the exchange stop must cover the whole position again
+            if self.replace_stop(sym, pos, pos["stop"], resize=True):
+                break
+            if sym not in self.positions or pos.get("exit_reason"):
+                return True  # price was already through the stop: the whole position was closed instead
+            self.sleep(1.0)
+        else:
+            return self.undo_add(sym, pos, fill["qty"], add_risk)
         at_stop = ((pos["stop"] - pos["entry"]) if side == S.LONG else (pos["entry"] - pos["stop"])) * pos["qty"]
         self.send(f"➕ 불타기 {pos['adds']}/{int(self.cfg['pyramid_max_adds'])} — {short(sym)} {SIDE_KO[side]}\n"
                   f"추가 {fill['qty']:g} @ {px(fill['avg'])} | 평균 진입가 {px(pos['entry'])} · 총 수량 {pos['qty']:g}\n"
                   f"손절 {px(pos['stop'])} (전체 수량에 다시 걸어둠) | 지금 손절되면 {usd(at_stop)} (수수료 전)")
         return True
+
+    def undo_add(self, sym, pos, qty, add_risk):
+        """The exchange would not take a stop for the bigger position: sell the added quantity again, so the stop
+        that is still there covers everything (one stop for the whole position, always)."""
+        close_side = "SELL" if pos["side"] == S.LONG else "BUY"
+        try:
+            r = self.broker.market(sym, close_side, qty, reduce_only=True, tag="U")
+        except (BinanceError, NetworkError) as e:
+            self.send(f"🚨 {short(sym)}: 추가 진입분({qty:g})에 손절을 걸지 못했고, 되돌리는 주문도 실패했습니다({e}).\n"
+                      "기존 손절은 처음 수량만 보호합니다. 봇이 20초마다 다시 시도합니다. 앱에서도 확인해 주세요.")
+            self.event("ERROR", where="undo_add", sym=sym, msg=str(e))
+            return False
+        f = self.filters.get(sym, R.DEFAULT_FILTER)
+        pos["qty"] = R.round_step(max(pos["qty"] - r["qty"], 0.0), f["step"])
+        pos["risk_amt"] = max(float(pos.get("risk_amt") or 0.0) - add_risk, 0.0)
+        self.save()
+        self.event("ADD_UNDONE", sym=sym, msg=f"{r['qty']:g}")
+        self.send(f"⚠️ {short(sym)}: 추가 진입분({r['qty']:g})에 손절 주문이 걸리지 않아 그만큼 바로 다시 정리했습니다. "
+                  "기존 포지션과 손절은 그대로입니다.")
+        return False
 
     def try_entries(self, now, only=None):
         cands = [(sym, d["sig"]) for sym, d in self.data.items()

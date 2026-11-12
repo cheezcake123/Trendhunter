@@ -42,6 +42,7 @@ def fmt_step(x, step):
 
 DEFAULT_FILTER = {"tick": 0.0001, "step": 0.001, "min_qty": 0.001, "max_qty": 1e9, "min_notional": 5.0}
 MMR = 0.01  # rough maintenance-margin rate used in the liquidation estimates
+MIN_ADD_FRAC = 0.5  # an add-on squeezed below half its intended size (margin, liquidation room) is not worth a slot
 
 
 def tight_margin(p):
@@ -77,12 +78,11 @@ def size_position(equity, available, entry, stop_dist, p, filt=None):
     if margin_cap <= 0:
         out["code"] = "NO_MARGIN"
         return out
-    max_lev = max(1, int(p["max_leverage"]))
+    cfg_lev = max(1, int(p["max_leverage"]))
     # keep the isolated-margin liquidation price well beyond the stop
     stop_pct = stop_dist / entry * 100.0
-    tight = tight_margin(p)
-    liq_cap = int(1.0 / (stop_pct * liq_buffer(p) / 100.0 + MMR))
-    max_lev = max(1, min(max_lev, liq_cap))
+    liq_cap = int(1.0 / (stop_pct * 1.3 / 100.0 + MMR))
+    max_lev = max(1, min(cfg_lev, liq_cap))
     qty = target_risk / stop_dist
     notional = qty * entry
     lev = max(1, math.ceil(notional / margin_cap - 1e-9))
@@ -91,10 +91,11 @@ def size_position(equity, available, entry, stop_dist, p, filt=None):
         notional = margin_cap * lev
         qty = notional / entry
         out["capped"] = True
-    if tight:
-        # liq_buffer_mult > 0: post as little isolated margin as the liquidation buffer allows. The position and
-        # its stop are the same; what shrinks is the money that can be lost if the stop cannot fill (gap, outage).
-        lev = max_lev
+    if tight_margin(p):
+        # liq_buffer_mult > 0: post as little isolated margin as that liquidation buffer allows. Leverage is only
+        # ever RAISED above what the size needs, so the quantity and the stop are exactly those of the old rule;
+        # what shrinks is the money that can be lost if the stop cannot fill (gap, outage).
+        lev = max(lev, min(max_lev, int(1.0 / (stop_pct * liq_buffer(p) / 100.0 + MMR))))
     qty = floor_step(qty, f["step"])
     min_qty_needed = max(float(f["min_qty"]), float(f["min_notional"]) * 1.01 / entry)
     if qty < min_qty_needed:
@@ -148,7 +149,7 @@ def size_addon(equity, available, pos, price, p, filt=None):
         out["code"] = "PAST_STOP"
         return out
     target_risk = equity * float(p["risk_per_trade_pct"]) / 100.0 * float(p.get("pyramid_risk_frac", 1.0))
-    qty = target_risk / max(dist_now, r_dist)
+    qty = wanted = target_risk / max(dist_now, r_dist)
     room = min(equity * float(p["max_margin_per_trade_pct"]) / 100.0 - qty0 * avg0 / lev, max(available, 0.0) * 0.95)
     if room <= 0:
         out["code"] = "NO_MARGIN"
@@ -171,6 +172,12 @@ def size_addon(equity, available, pos, price, p, filt=None):
         if qty > qty0 * slack / a:
             qty = qty0 * slack / a
             out["capped"] = True
+            if qty < wanted * MIN_ADD_FRAC:
+                out["code"] = "LIQ_TOO_CLOSE"
+                return out
+    if qty < wanted * MIN_ADD_FRAC:
+        out["code"] = "NO_MARGIN"
+        return out
     qty = min(qty, float(f["max_qty"]) - qty0)
     qty = floor_step(qty, f["step"])
     if qty <= 0 or qty < max(float(f["min_qty"]), float(f["min_notional"]) * 1.01 / price):
@@ -244,6 +251,7 @@ GUARD_KO = {
     "BAD_INPUT": "입력값 오류",
     "LIQ_TOO_CLOSE": "청산가가 손절가에 너무 가까움",
     "PAST_STOP": "가격이 이미 손절가를 지남",
+    "OUT_OF_SYNC": "거래소 포지션이 장부와 달라 보류",
 }
 
 
