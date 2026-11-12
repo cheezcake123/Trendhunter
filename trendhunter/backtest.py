@@ -162,6 +162,7 @@ def simulate(cfg, pre, start_ms, risk_pct=None, start_equity=100.0, filters=None
     sslip = float(stop_slip_bps) / 1e4
     tf_ms = TF_MS[p["signal_tf"]]
     fund_bar = float(funding_bps_8h) / 1e4 * tf_ms / (8 * 3_600_000)
+    pyramid = int(p.get("pyramid_max_adds", 0) or 0) > 0
     times = sorted({t for s in pre.values() for t in s["ind"]["t"] if t >= start_ms})
     cash = float(start_equity)
     L = R.new_ledger(cash, start_ms / 1000)
@@ -179,7 +180,8 @@ def simulate(cfg, pre, start_ms, risk_pct=None, start_equity=100.0, filters=None
         R.on_exit(L, sym, net, t_close / 1000, p)
         trades.append({"sym": sym, "side": q["side"], "t_in": q["opened_ms"], "t_out": t_close,
                        "entry": q["entry"], "exit": exit_px, "qty": q["qty"], "pnl": net,
-                       "r": net / q["risk_amt"] if q["risk_amt"] else 0.0, "reason": reason, "lev": q["lev"]})
+                       "r": net / q["risk_amt"] if q["risk_amt"] else 0.0, "reason": reason, "lev": q["lev"],
+                       "adds": q["adds"]})
 
     def mtm():
         u = 0.0
@@ -231,6 +233,29 @@ def simulate(cfg, pre, start_ms, risk_pct=None, start_equity=100.0, filters=None
                 last_close[sym] = s["ind"]["c"][i]
         eq = mtm()
         R.roll_day(L, now_s, eq)
+        if pyramid:  # add to winners whose stop already locks the earlier units (same rule as the live bot)
+            for sym, q in pos.items():
+                i = pre[sym]["idx"].get(t)
+                if i is None or not S.addon_due(q, pre[sym]["ind"]["c"][i], p):
+                    continue
+                ok, code = R.can_add(L, now_s, eq, p)
+                c = pre[sym]["ind"]["c"][i]
+                px_in = c * (1 + slip if q["side"] == S.LONG else 1 - slip)
+                sz = R.size_addon(eq, cash - sum(x["margin"] for x in pos.values()), q, px_in, p,
+                                  (filters or {}).get(sym)) if ok else {"ok": False, "code": code}
+                if not sz["ok"]:
+                    skips["ADD_" + sz["code"]] = skips.get("ADD_" + sz["code"], 0) + 1
+                    continue
+                fin = sz["qty"] * px_in * fee
+                cash -= fin
+                q["entry"] = (q["entry"] * q["qty"] + px_in * sz["qty"]) / (q["qty"] + sz["qty"])
+                q["qty"] += sz["qty"]
+                q["fee_in"] += fin
+                q["margin"] += sz["margin"]
+                q["risk_amt"] += sz["risk_amt"]
+                q["adds"] += 1
+                q["last_add_px"] = px_in
+                eq = mtm()
         cands = []
         for sym, s in pre.items():
             i = s["idx"].get(t)
@@ -249,7 +274,7 @@ def simulate(cfg, pre, start_ms, risk_pct=None, start_equity=100.0, filters=None
             entry = sig["close"] * (1 + slip if side == S.LONG else 1 - slip)
             stop, dist = S.initial_stop(side, entry, sig["atr"], p)
             used = sum(q["margin"] for q in pos.values())
-            sz = R.size_position(eq, eq - used, entry, dist, p, (filters or {}).get(sym))
+            sz = R.size_position(eq, cash - used, entry, dist, p, (filters or {}).get(sym))
             if not sz["ok"]:
                 skips[sz["code"]] = skips.get(sz["code"], 0) + 1
                 continue
@@ -257,7 +282,8 @@ def simulate(cfg, pre, start_ms, risk_pct=None, start_equity=100.0, filters=None
             cash -= fin
             pos[sym] = {"side": side, "entry": entry, "qty": sz["qty"], "stop": stop, "r_dist": dist,
                         "atr": sig["atr"], "extreme": entry, "opened_ms": t_close, "fee_in": fin, "funding": 0.0,
-                        "margin": sz["margin"], "risk_amt": sz["qty"] * dist, "lev": sz["lev"]}
+                        "margin": sz["margin"], "risk_amt": sz["qty"] * dist, "lev": sz["lev"],
+                        "adds": 0, "last_add_px": entry}
             R.on_entry(L, now_s)
             eq = mtm()
         eq = mtm()
@@ -326,6 +352,11 @@ def metrics(res):
 REASON_SHORT = {"STOP": "손절", "TRAIL": "추적", "TIME": "시간", "REVERSE": "반대", "END": "종료"}
 
 
+def pyramid_note(cfg):
+    n = int(cfg.get("pyramid_max_adds", 0) or 0)
+    return f" · 불타기 최대 {n}회" if n > 0 else ""
+
+
 def format_report(cfg, days, start_ms, end_ms, results, cur_risk, n_syms):
     def usd(x):
         return f"${x:,.2f}"
@@ -337,7 +368,7 @@ def format_report(cfg, days, start_ms, end_ms, results, cur_risk, n_syms):
     fund = FUNDING_KO.get(results[cur_risk].get("funding_mode"), "펀딩비")
     lines = [f"📊 백테스트 — 최근 {days}일 ({d0}~{d1}), {n_syms}종목",
              f"수수료 0.05%·슬리피지·{fund} 반영, 시작 $100", "",
-             f"[현재 설정: 1회 위험 {cur_risk:g}%]",
+             f"[현재 설정: 1회 위험 {cur_risk:g}%{pyramid_note(cfg)}]",
              f"최종 {usd(m['final'])} ({m['ret']:+.1f}%) | 최대낙폭 {m['max_dd']:.1f}%",
              f"거래 {m['n']}회 · 승률 {m['win']:.0f}% · 평균 {m['avg_r']:+.2f}R · 수익팩터 {pf}"]
     if m["n"]:

@@ -201,6 +201,27 @@ def trail_stop(side, entry, r_dist, cur_stop, extreme, atr_value, p):
     return cand
 
 
+def is_locked(side, entry, stop):
+    """True once the stop sits at the (average) entry or better: the position can no longer lose at its stop."""
+    return stop >= entry if side == LONG else stop <= entry
+
+
+def addon_due(pos, close, p):
+    """Pyramiding trigger on a CLOSED signal candle (same rule live and in the backtest).
+
+    Add a unit only to a winner whose stop already locks the average entry, and only after the close has
+    moved pyramid_step_r x R (R = the first unit's stop distance) beyond the last entry/add price.
+    """
+    n = int(p.get("pyramid_max_adds", 0) or 0)
+    if n <= 0 or int(pos.get("adds", 0) or 0) >= n or pos.get("adopted"):
+        return False
+    if not is_locked(pos["side"], pos["entry"], pos["stop"]):
+        return False
+    step = float(p.get("pyramid_step_r", 1.5)) * float(pos["r_dist"])
+    ref = float(pos.get("last_add_px") or pos["entry"])
+    return close >= ref + step if pos["side"] == LONG else close <= ref - step
+
+
 prepare_signal = None  # set below (readable aliases)
 
 

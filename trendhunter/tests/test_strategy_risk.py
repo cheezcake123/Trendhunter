@@ -102,7 +102,10 @@ class SizingTests(unittest.TestCase):
         self.assertTrue(sz["ok"])
         self.assertAlmostEqual(sz["risk_amt"], 3.0, places=2)
         self.assertLessEqual(sz["margin"], 30.0 + 1e-9)
-        self.assertEqual(sz["lev"], 5)
+        self.assertEqual(sz["lev"], 10)  # v2.4: highest leverage the liquidation buffer allows -> least margin
+        old = R.size_position(100, 100, 100.0, 2.0, dict(CFG, liq_buffer_mult=0), self.F)
+        self.assertEqual(old["lev"], 5)  # liq_buffer_mult 0 = the old rule: smallest leverage that fits
+        self.assertEqual(old["qty"], sz["qty"], "the leverage rule must not change the position size")
 
     def test_tight_stop_caps_by_margin_and_leverage(self):
         sz = R.size_position(100, 100, 100.0, 0.2, CFG, self.F)  # wants $1500 notional

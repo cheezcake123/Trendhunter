@@ -41,6 +41,18 @@ def fmt_step(x, step):
 
 
 DEFAULT_FILTER = {"tick": 0.0001, "step": 0.001, "min_qty": 0.001, "max_qty": 1e9, "min_notional": 5.0}
+MMR = 0.01  # rough maintenance-margin rate used in the liquidation estimates
+MIN_ADD_FRAC = 0.5  # an add-on squeezed below half its intended size (margin, liquidation room) is not worth a slot
+
+
+def tight_margin(p):
+    """liq_buffer_mult > 0: entries use the highest leverage the liquidation buffer allows (least margin at stake)."""
+    return float(p.get("liq_buffer_mult") or 0) > 0
+
+
+def liq_buffer(p):
+    """How many stop distances the liquidation price must stay away from the entry (never below 1.3)."""
+    return max(float(p.get("liq_buffer_mult") or 0), 1.3)
 
 # ---------------------------------------------------------------- sizing
 
@@ -66,11 +78,11 @@ def size_position(equity, available, entry, stop_dist, p, filt=None):
     if margin_cap <= 0:
         out["code"] = "NO_MARGIN"
         return out
-    max_lev = max(1, int(p["max_leverage"]))
+    cfg_lev = max(1, int(p["max_leverage"]))
     # keep the isolated-margin liquidation price well beyond the stop
     stop_pct = stop_dist / entry * 100.0
-    liq_cap = int(1.0 / (stop_pct * 1.3 / 100.0 + 0.01))
-    max_lev = max(1, min(max_lev, liq_cap))
+    liq_cap = int(1.0 / (stop_pct * 1.3 / 100.0 + MMR))
+    max_lev = max(1, min(cfg_lev, liq_cap))
     qty = target_risk / stop_dist
     notional = qty * entry
     lev = max(1, math.ceil(notional / margin_cap - 1e-9))
@@ -79,6 +91,11 @@ def size_position(equity, available, entry, stop_dist, p, filt=None):
         notional = margin_cap * lev
         qty = notional / entry
         out["capped"] = True
+    if tight_margin(p):
+        # liq_buffer_mult > 0: post as little isolated margin as that liquidation buffer allows. Leverage is only
+        # ever RAISED above what the size needs, so the quantity and the stop are exactly those of the old rule;
+        # what shrinks is the money that can be lost if the stop cannot fill (gap, outage).
+        lev = max(lev, min(max_lev, int(1.0 / (stop_pct * liq_buffer(p) / 100.0 + MMR))))
     qty = floor_step(qty, f["step"])
     min_qty_needed = max(float(f["min_qty"]), float(f["min_notional"]) * 1.01 / entry)
     if qty < min_qty_needed:
@@ -102,10 +119,72 @@ def size_position(equity, available, entry, stop_dist, p, filt=None):
     return out
 
 
-def liquidation_buffer_ok(lev, stop_pct, mmr=0.01):
+def liquidation_buffer_ok(lev, stop_pct, mmr=0.01, buf=1.3):
     """Rough isolated-margin check: liquidation must sit well beyond the stop."""
     liq_pct = (1.0 / lev - mmr) * 100.0
-    return liq_pct > stop_pct * 1.3
+    return liq_pct > stop_pct * buf
+
+
+def size_addon(equity, available, pos, price, p, filt=None):
+    """Pyramiding: one more unit for a position whose stop already protects the earlier units.
+
+    The add risks risk_per_trade_pct x pyramid_risk_frac of equity between `price` and the CURRENT stop, but is
+    never sized on a distance tighter than the first unit's stop (so an add is never bigger than a fresh entry).
+    It uses the position's leverage, fits the whole pyramid into max_margin_per_trade_pct of equity and keeps
+    the liquidation price of the combined position beyond the stop with the same buffer as an entry.
+    """
+    f = dict(DEFAULT_FILTER)
+    if filt:
+        f.update(filt)
+    out = {"ok": False, "code": None, "qty": 0.0, "notional": 0.0, "margin": 0.0, "risk_amt": 0.0, "capped": False}
+    long = pos.get("side") == "LONG"
+    qty0, avg0, stop = float(pos.get("qty") or 0), float(pos.get("entry") or 0), float(pos.get("stop") or 0)
+    lev = int(pos.get("lev") or 0)
+    r_dist = float(pos.get("r_dist") or 0)
+    if equity <= 0 or price <= 0 or qty0 <= 0 or avg0 <= 0 or lev < 1 or r_dist <= 0:
+        out["code"] = "BAD_INPUT"
+        return out
+    dist_now = (price - stop) if long else (stop - price)
+    if dist_now <= 0:
+        out["code"] = "PAST_STOP"
+        return out
+    target_risk = equity * float(p["risk_per_trade_pct"]) / 100.0 * float(p.get("pyramid_risk_frac", 1.0))
+    qty = wanted = target_risk / max(dist_now, r_dist)
+    room = min(equity * float(p["max_margin_per_trade_pct"]) / 100.0 - qty0 * avg0 / lev, max(available, 0.0) * 0.95)
+    if room <= 0:
+        out["code"] = "NO_MARGIN"
+        return out
+    if qty * price / lev > room:
+        qty = room * lev / price
+        out["capped"] = True
+    # liquidation of the combined position: |average entry - stop| / average entry must stay within `b`
+    b = (1.0 / lev - MMR) / liq_buffer(p)
+    if long:
+        a = price * (1 - b) - stop
+        slack = stop - avg0 * (1 - b)
+    else:
+        a = stop - price * (1 + b)
+        slack = avg0 * (1 + b) - stop
+    if a > 0:
+        if slack <= 0:
+            out["code"] = "LIQ_TOO_CLOSE"
+            return out
+        if qty > qty0 * slack / a:
+            qty = qty0 * slack / a
+            out["capped"] = True
+            if qty < wanted * MIN_ADD_FRAC:
+                out["code"] = "LIQ_TOO_CLOSE"
+                return out
+    if qty < wanted * MIN_ADD_FRAC:
+        out["code"] = "NO_MARGIN"
+        return out
+    qty = min(qty, float(f["max_qty"]) - qty0)
+    qty = floor_step(qty, f["step"])
+    if qty <= 0 or qty < max(float(f["min_qty"]), float(f["min_notional"]) * 1.01 / price):
+        out["code"] = "SIZE_TOO_SMALL"
+        return out
+    out.update(ok=True, code="OK", qty=qty, notional=qty * price, margin=qty * price / lev, risk_amt=qty * dist_now)
+    return out
 
 
 # ---------------------------------------------------------------- ledger & guards
@@ -171,21 +250,37 @@ GUARD_KO = {
     "NO_MARGIN": "증거금 부족",
     "BAD_INPUT": "입력값 오류",
     "LIQ_TOO_CLOSE": "청산가가 손절가에 너무 가까움",
+    "PAST_STOP": "가격이 이미 손절가를 지남",
+    "OUT_OF_SYNC": "거래소 포지션이 장부와 달라 보류",
 }
 
 
-def can_enter(L, positions, sym, side, now, equity, p, paused=False, blocked=False):
+def account_guard(L, now, equity, p, paused=False, blocked=False):
+    """Account-wide reasons not to add risk right now (None = clear). Shared by entries and add-ons."""
     if blocked:
-        return False, "BLOCKED"
+        return "BLOCKED"
     if paused:
-        return False, "PAUSED"
+        return "PAUSED"
     floor = float(L.get("start_equity", 0.0)) * float(p["equity_floor_pct"]) / 100.0
     if equity < floor:
-        return False, "EQUITY_FLOOR"
+        return "EQUITY_FLOOR"
     if L.get("day_limit_hit"):
-        return False, "DAILY_LIMIT"
+        return "DAILY_LIMIT"
     if now < float(L.get("pause_until", 0.0)):
-        return False, "STREAK_PAUSE"
+        return "STREAK_PAUSE"
+    return None
+
+
+def can_add(L, now, equity, p, paused=False, blocked=False):
+    """Guards for a pyramiding add-on: everything account-wide; the per-symbol entry limits do not apply."""
+    code = account_guard(L, now, equity, p, paused, blocked)
+    return (False, code) if code else (True, "OK")
+
+
+def can_enter(L, positions, sym, side, now, equity, p, paused=False, blocked=False):
+    code = account_guard(L, now, equity, p, paused, blocked)
+    if code:
+        return False, code
     if int(L.get("day_entries", 0)) >= int(p["max_entries_per_day"]):
         return False, "MAX_ENTRIES"
     if sym in positions:

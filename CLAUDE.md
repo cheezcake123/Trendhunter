@@ -25,4 +25,6 @@
   - pandas 비교 테스트 6개는 pandas가 없으면 건너뛴다(정상).
 - zip 다시 만들기(저장소 루트에서, `__pycache__` 제외):
   `python3 -c "import os,zipfile; z=zipfile.ZipFile('trendhunter.zip','w',zipfile.ZIP_DEFLATED); [z.write(os.path.join(b,f)) for b,d,fs in sorted(os.walk('trendhunter')) if '__pycache__' not in b for f in sorted(fs)]; z.close()"`
+- 전략·위험 규칙을 바꿀 때는 실제 데이터로 검증한다: `research/lab.py`(사용법은 파일 머리말). 공개 저장소 `finom/static-klines`의 바이낸스 캔들을 쓰며, 바이낸스 API가 막힌 환경에서도 돌아간다. `research/`는 zip에 넣지 않는다.
+  - 비교는 전체 기간 하나로 끝내지 말고 2020~23 / 2024~ 두 구간, 주변 값, 종목 하나씩 빼기까지 본다. 규칙은 `strategy.py`·`risk.py`에 두어 실전과 백테스트가 같은 코드를 쓰게 한다.
 - 줄바꿈은 LF만 쓴다(`.gitattributes`로 고정). CRLF가 섞인 `install.sh`·`th`는 서버에서 실행되지 않는다.

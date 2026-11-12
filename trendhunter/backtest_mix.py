@@ -165,7 +165,7 @@ def format_report(cfg, days, out):
              f"[현재 설정: 현물 {share * 100:.0f}% + 선물 {100 - share * 100:.0f}%]",
              f"합계 ${final:,.2f} ({line(comb)})",
              f"· 현물 모멘텀({out['n_spot']}개 후보 중 거래대금 상위 {cfg.get('spot_universe_size', 6)}): {line(sp)}",
-             f"· 선물 돌파(1회 위험 {cfg['risk_per_trade_pct']:g}%): {line(fu)}",
+             f"· 선물 돌파(1회 위험 {cfg['risk_per_trade_pct']:g}%{BT.pyramid_note(cfg)}): {line(fu)}",
              f"  거래 {m['n']}회 · 승률 {m['win']:.0f}% · 평균 {m['avg_r']:+.2f}R · 수익팩터 {pf}", "",
              "[배분별 비교]"]
     for s, pts in sorted(out["mixes"].items(), reverse=True):
