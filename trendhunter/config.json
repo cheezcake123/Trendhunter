@@ -1,6 +1,6 @@
 {
   "bot_name": "TrendHunter",
-  "version": "2.4.0",
+  "version": "2.5.0",
   "spot_enabled": true,
   "alloc_spot_pct": 50,
   "alloc_band_pct": 10,
@@ -101,5 +101,6 @@
   "brief_morning_kst": "08:00",
   "brief_evening_kst": "21:15",
   "monthly_report": true,
+  "flow_detect": true,
   "update_url": ""
 }

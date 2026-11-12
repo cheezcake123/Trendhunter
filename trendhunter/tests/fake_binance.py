@@ -331,6 +331,7 @@ class FakeExchange:
                 return self.err(-1102, "bad type")
             self.seq += 1
             self.transfers.append({"type": P["type"], "amount": amt, "time": now_ms, "tranId": self.seq})
+            self._transfer_income(amt if P["type"] == "MAIN_UMFUTURE" else -amt, now_ms)
             if self.transfer_drop_response > 0:
                 self.transfer_drop_response -= 1
                 return 599, {"code": -1007, "msg": "Timeout"}
@@ -639,6 +640,30 @@ class FakeExchange:
         return 200, dict(a)
 
     # ------------------------------------------------------------ test helpers
+    def _transfer_income(self, amount, t_ms):
+        """Like Binance: every transfer into (+) or out of (-) the futures wallet is a TRANSFER income row."""
+        self.income.append({"symbol": "", "incomeType": "TRANSFER", "income": f"{amount}", "asset": "USDT",
+                            "info": "TRANSFER", "time": t_ms, "tranId": self.seq})
+
+    def outside_deposit(self, amount, asset="USDT"):
+        """Money (or coins) arriving in the spot wallet from outside; a negative amount is a withdrawal."""
+        self.spot_bal[asset] = self.spot_bal.get(asset, 0.0) + amount
+
+    def app_transfer(self, amount, to_futures=True):
+        """The user moves USDT between the spot and futures wallets by hand in the Binance app."""
+        sign = 1 if to_futures else -1
+        self.spot_bal["USDT"] = self.spot_bal.get("USDT", 0.0) - sign * amount
+        self.wallet += sign * amount
+        self.seq += 1
+        self._transfer_income(sign * amount, int(self.clock() * 1000))
+
+    def outside_futures(self, amount):
+        """USDT arriving in (+) or leaving (-) the futures wallet from outside the two wallets the bot runs
+        (e.g. from the funding wallet)."""
+        self.wallet += amount
+        self.seq += 1
+        self._transfer_income(amount, int(self.clock() * 1000))
+
     def open_algos(self, sym=None):
         return [a for a in self.algos.values() if a["algoStatus"] == "NEW" and (sym is None or a["symbol"] == sym)]
 

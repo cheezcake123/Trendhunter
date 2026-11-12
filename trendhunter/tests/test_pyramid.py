@@ -432,10 +432,20 @@ class LiveAdds(unittest.TestCase):
         store.save_state(st)
         tr2, tg2, _ = make_trader(self.fake, self.clock, self.tmp)
         tr2.startup()
-        self.assertEqual(sum(t.startswith("🆕 v2.4") for t in tg2.texts()), 1)
+        notes = [t for t in tg2.texts() if t.startswith("🆕")]
+        self.assertEqual(len(notes), len(B.WHATS_NEW), "an install that skipped versions gets every note, once each")
+        self.assertEqual(sum(t.startswith("🆕 v2.4") for t in notes), 1)
         tr3, tg3, _ = make_trader(self.fake, self.clock, self.tmp)
         tr3.startup()
         self.assertFalse(any(t.startswith("🆕") for t in tg3.texts()))
+        st = store.load_state()
+        st["seen_version"] = "2.4.0"  # the usual case: one version behind
+        store.save_state(st)
+        tr4, tg4, _ = make_trader(self.fake, self.clock, self.tmp)
+        tr4.startup()
+        newer = [t for t in tg4.texts() if t.startswith("🆕")]
+        self.assertEqual(len(newer), len([v for v in B.WHATS_NEW if B.ver_key(v) > (2, 4, 0)]))
+        self.assertFalse(any(t.startswith("🆕 v2.4") for t in newer))
 
     def test_presets_and_settings(self):
         tr, tg, store = self.started(over={"pyramid_max_adds": 0})

@@ -58,7 +58,8 @@ def futures_stats(trades):
 
 
 def equity_window(hist, start, end):
-    """First and last daily total-equity rows inside [start, end]. hist rows: [utc_day, spot, futures]."""
+    """First and last daily total-equity rows inside [start, end]. hist rows: [utc_day, spot, futures] and,
+    since v2.5, a 4th value: the unit price of the account (total equity with deposits/withdrawals taken out)."""
     d0, d1 = _day(start), _day(end)
     rows = [h for h in hist if d0 <= h[0] <= d1]
     if len(rows) < 2:
@@ -90,15 +91,33 @@ def health_line(recent):
             "추세추종은 이런 구간을 자주 겪습니다. 위험을 낮추려면 /preset 안정 또는 /risk 2")
 
 
-def monthly_text(label, mode_ko, hist, start, end, trades, recent, spot_fills, btc_rows=None):
+def window_flows(flows, day0, day1):
+    """Net outside money (deposits - withdrawals) booked after the day0 row and up to the day1 row.
+    A day's row is written a few minutes after 00:00 UTC, so the cut is 10 minutes into each day."""
+    lo, hi = _day_ms(day0) / 1000 + 600, _day_ms(day1) / 1000 + 600
+    return sum(float(f.get("net") or 0.0) for f in flows or [] if lo < float(f.get("ts") or 0) <= hi)
+
+
+def monthly_text(label, mode_ko, hist, start, end, trades, recent, spot_fills, btc_rows=None, flows=None):
     lines = [f"📅 월간 리포트 — {label} (매일 09시 KST 기준) | {mode_ko}"]
     win = equity_window(hist, start, end)
+    mixed = True  # True while the total-equity change may still contain deposits / withdrawals
     if win:
-        (d0, s0, f0), (d1, s1, f1) = win
-        t0, t1 = s0 + f0, s1 + f1
+        r0, r1 = win
+        d0, d1 = r0[0], r1[0]
+        t0, t1 = r0[1] + r0[2], r1[1] + r1[2]
+        nav0 = r0[3] if len(r0) > 3 else None
+        nav1 = r1[3] if len(r1) > 3 else None
         since = "" if d0 == _day(start) else f" [{d0[5:].replace('-', '/')}부터]"
-        chg = f" ({(t1 / t0 - 1) * 100:+.1f}%)" if t0 > 0 else ""
-        lines.append(f"총자산 {_usd(t0, False)} → {_usd(t1, False)}{chg}{since}")
+        if nav0 and nav1:
+            mixed = False
+            net = window_flows(flows, d0, d1)
+            lines.append(f"총자산 {_usd(t0, False)} → {_usd(t1, False)} | 수익률 {(nav1 / nav0 - 1) * 100:+.1f}%{since}")
+            if abs(net) >= 0.005:
+                lines.append(f"  (이 기간 순입금 {_usd(net)} — 수익률은 입금·출금을 빼고 계산했습니다)")
+        else:
+            chg = f" ({(t1 / t0 - 1) * 100:+.1f}%)" if t0 > 0 else ""
+            lines.append(f"총자산 {_usd(t0, False)} → {_usd(t1, False)}{chg}{since}")
         b = btc_change(btc_rows, d0, d1)
         if b is not None:
             lines.append(f"같은 기간 BTC 보유: {b:+.1f}%")
@@ -116,5 +135,6 @@ def monthly_text(label, mode_ko, hist, start, end, trades, recent, spot_fills, b
     h = health_line(recent)
     if h:
         lines.append(h)
-    lines.append("※ 총자산 변화에는 입금·출금도 섞일 수 있습니다. 선물 실현손익은 입출금과 무관한 매매 결과입니다.")
+    if mixed:
+        lines.append("※ 총자산 변화에는 입금·출금도 섞일 수 있습니다. 선물 실현손익은 입출금과 무관한 매매 결과입니다.")
     return "\n".join(lines)

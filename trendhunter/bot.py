@@ -32,7 +32,7 @@ import risk as R  # noqa: E402
 import strategy as S  # noqa: E402
 from binance_api import BinanceError, BinanceFutures, NetworkError, parse_filters  # noqa: E402
 from binance_spot import BinanceSpot  # noqa: E402
-from brokers import LiveBroker, PaperBroker  # noqa: E402
+from brokers import LiveBroker, PaperBroker, _chunks  # noqa: E402
 from spot import SpotManager, utc_day  # noqa: E402
 from store import Store, load_config  # noqa: E402
 from telegram_client import Poller, Telegram  # noqa: E402
@@ -69,6 +69,9 @@ PRESET_NOTE = {  # v2.4 rules on Binance candles 2020-01 ~ 2026-11, funding assu
     "공격": "과거 최대낙폭 약 -41%, 2024~26 연 74%",
 }
 WHATS_NEW = {
+    "2.5.0": "🆕 v2.5 — 입금·출금을 봇이 스스로 알아챕니다(실전 모드, 10분 안). 수익률·최대낙폭·월간 리포트는 넣거나 뺀 "
+             "돈을 빼고 계산하고, 새로 넣은 돈은 다음 09:05 KST 점검 때 현물·선물로 나눕니다.\n"
+             "기록 보기: /flows · 잘못 잡힌 기록 취소: /flows undo · 입금 뒤 /rebase 는 이제 필요 없습니다.",
     "2.4.0": "🆕 v2.4 — 불타기(수익 중 추가 진입)를 쓸 수 있습니다. 기본은 꺼져 있고 /preset 에서 단계를 고르면 켜집니다.\n"
              "선물 진입은 이제 같은 포지션 크기를 더 적은 증거금으로 잡습니다(레버리지 숫자는 커지지만 손절 위험은 같고, "
              "손절이 미끄러질 때 잃을 수 있는 최대 금액이 줄어듭니다).",
@@ -81,7 +84,9 @@ COMMANDS = [
     ("settings", "설정 보기"), ("set", "설정 변경: /set 키 값"), ("backtest", "백테스트: /backtest 365"),
     ("selftest", "계정·API 점검"), ("live", "실전 모드 전환"), ("paper", "모의 모드 전환"),
     ("update", "코드 업데이트"), ("rollback", "직전 버전 복구"), ("restart", "봇 재시작"),
-    ("rebase", "자본 기준점 재설정"), ("export", "거래기록 CSV 받기"), ("report", "월간 리포트"), ("help", "도움말"),
+    ("rebase", "자본 기준점 재설정"), ("export", "거래기록 CSV 받기"), ("report", "월간 리포트"),
+    ("flows", "입금·출금 기록"), ("deposit", "놓친 입금 적기: /deposit 100"), ("withdraw", "놓친 출금 적기: /withdraw 100"),
+    ("help", "도움말"),
 ]
 SETTABLE = {
     "risk_per_trade_pct": (float, 0.25, 5.0),
@@ -118,6 +123,7 @@ SETTABLE = {
     "brief_morning_kst": ("hhmm", None, None),
     "brief_evening_kst": ("hhmm", None, None),
     "monthly_report": (bool, None, None),
+    "flow_detect": (bool, None, None),
 }
 
 
@@ -125,6 +131,11 @@ SETTABLE = {
 
 def short(sym):
     return sym[:-4] if sym.endswith("USDT") else sym
+
+
+def ver_key(v):
+    """'2.10.1' -> (2, 10, 1) so versions compare as numbers."""
+    return tuple(int(x) if x.isdigit() else 0 for x in str(v).split("."))
 
 
 def usd(x, signed=True):
@@ -208,6 +219,7 @@ class Trader:
         st.setdefault("spot", {})
         st.setdefault("total", {})
         st.setdefault("hist", [])
+        st.setdefault("flow_fut", {})
         self.state = st
         self.filters = {}
         self.filters_loaded_at = 0.0
@@ -222,6 +234,7 @@ class Trader:
         self.last_alert = {}
         self.candle_retry = None
         self.fetch_failed = set()  # symbols whose last klines call failed
+        self.flow_ckpt = None      # peaks as they stood at the last look for outside money (see book_flow)
 
     # ------------------------------------------------------------ basics
     @property
@@ -313,10 +326,13 @@ class Trader:
         if self.state.get("paused"):
             lines.append("⏸ 일시정지 상태입니다 (/resume 으로 재개)")
         self.send("\n".join(lines), keyboard=KEYBOARD)
-        ver = str(self.cfg["version"])
-        if self.state.get("seen_version") != ver:
-            if (self.state.get("seen_version") or self.ran_before) and ver in WHATS_NEW:  # an update, not a new install
-                self.send(WHATS_NEW[ver])
+        self.flow_ckpt = self._peaks()
+        ver, seen = str(self.cfg["version"]), self.state.get("seen_version")
+        if seen != ver:
+            if seen or self.ran_before:  # an update, not a new install: every note the user has not seen yet
+                for v in sorted(WHATS_NEW, key=ver_key):
+                    if ver_key(seen or "0") < ver_key(v) <= ver_key(ver):
+                        self.send(WHATS_NEW[v])
             self.state["seen_version"] = ver
             self.save()
 
@@ -517,6 +533,7 @@ class Trader:
                 return
         try:
             self.resolve_pending_transfer(now)
+            self.flow_pass(now)  # outside money is booked before anything below looks at the totals
             if self.spot.due(now):
                 self.daily_spot(now)
             else:
@@ -572,6 +589,7 @@ class Trader:
             self._book_transfer(amount, to_futures, fut_before, why)
             return amount
         t0 = self.server_ms()
+        self.spot.mark_own()
         try:
             self.spot.ex.transfer(to_futures, amount)
         except (BinanceError, NetworkError) as e:
@@ -660,29 +678,169 @@ class Trader:
                       "다음 점검 때 다시 맞춥니다. 잔고가 이상해 보이면 /rebase 로 기준점을 다시 잡으세요.")
         self.save()
 
+    def _scale_ledger(self, fut_before, fut_after, peak0=None):
+        """Money moved into or out of the futures wallet (the bot's own transfer, or from outside): scale the
+        guard baselines so the floor, the daily limit and the drawdown keep measuring trading, not the transfer.
+        peak0: the peak as it stood before the money arrived (it may already have been pushed up by it).
+        Returns the factor used, or None when the baselines were set afresh (the wallet was empty)."""
+        L = self.ledger
+        if L is None:
+            return None
+        k = None
+        if peak0:
+            L["peak_equity"] = peak0
+        if fut_before > 0 and fut_after > 0:
+            k = fut_after / fut_before
+            for key in ("start_equity", "peak_equity", "day_start_equity"):
+                L[key] = float(L.get(key) or 0.0) * k
+        elif fut_after <= 0 < fut_before:  # the wallet was emptied: nothing left to guard until money comes back
+            L["start_equity"] = L["peak_equity"] = L["day_start_equity"] = 0.0
+        if float(L.get("start_equity") or 0) <= 0 < fut_after:
+            L["start_equity"] = L["peak_equity"] = L["day_start_equity"] = fut_after
+            k = None
+        if peak0:
+            L["peak_equity"] = max(float(L.get("peak_equity") or 0.0), fut_after)
+        floor = float(L.get("start_equity") or 0) * float(self.cfg["equity_floor_pct"]) / 100.0
+        if self.state.get("floor_alerted") and fut_after >= floor:
+            self.state["floor_alerted"] = False  # the alert came from an unscaled baseline
+        return k
+
     def _book_transfer(self, amount, to_futures, fut_before, why):
         fut_after = fut_before + (amount if to_futures else -amount)
-        L = self.ledger
-        if L is not None:
-            if fut_before > 0 and fut_after > 0:
-                k = fut_after / fut_before
-                for key in ("start_equity", "peak_equity", "day_start_equity"):
-                    L[key] = float(L.get(key) or 0.0) * k
-            if float(L.get("start_equity") or 0) <= 0 < fut_after:
-                L["start_equity"] = L["peak_equity"] = L["day_start_equity"] = fut_after
-            floor = float(L.get("start_equity") or 0) * float(self.cfg["equity_floor_pct"]) / 100.0
-            if self.state.get("floor_alerted") and fut_after >= floor:
-                self.state["floor_alerted"] = False  # the alert came from an unscaled baseline
+        self._scale_ledger(fut_before, fut_after)
         st = self.state["spot"]
         st["net_in"] = float(st.get("net_in") or 0.0) + (-amount if to_futures else amount)
         if self.spot is not None:
-            self.spot.cache = None
+            self.spot.mark_own()
         self.state["equity"] = fut_after
         rec = {"ts": self.now(), "mode": self.state["mode"], "to": "futures" if to_futures else "spot",
                "amount": amount, "why": why}
         self.store.append("transfers.jsonl", rec)
         self.event("TRANSFER", msg=f"{'현물→선물' if to_futures else '선물→현물'} {amount:.2f}")
         self.save()
+
+    # ------------------------------------------------------------ outside money (deposits / withdrawals)
+    def _peaks(self):
+        return {"t": float((self.state.get("total") or {}).get("peak") or 0.0),
+                "l": float((self.ledger or {}).get("peak_equity") or 0.0)}
+
+    def flow_pass(self, now, force=False):
+        """Look for money that came in or went out from outside and book it. Live mode only; runs when the spot
+        valuation is refreshed anyway (every 10 minutes and before the daily job) or when a refresh has already
+        seen something. Both wallets are judged together, so money the user moved between them in the app nets
+        to zero. Returns the booked record, or None."""
+        if self.state["mode"] != "live" or not self.cfg.get("flow_detect", True) or self.state.get("pending_transfer"):
+            return None
+        sp = self.spot
+        stale = force or not sp.cache or now - sp.cache_ts >= 600 or sp.due(now)
+        if not stale and abs(float(sp.state.get("flow_acc") or 0.0)) < 1e-9:
+            return None
+        if stale:
+            sp.value(refresh=True)
+        fut_flow, mark = self.futures_outside_transfers()
+        if fut_flow is None:
+            return None  # keep what the spot side saw: both sides are booked together once the history can be read
+        spot_flow = float(sp.state.get("flow_acc") or 0.0)
+        sp.state["flow_acc"] = 0.0
+        self.state["flow_fut"] = mark
+        floor = max(1.0, self.total_equity()[0] * 0.001)  # below this it is interest, dust or rounding
+        spot_flow = spot_flow if abs(spot_flow) >= floor else 0.0
+        fut_flow = fut_flow if abs(fut_flow) >= floor else 0.0
+        rec = self.book_flow(now, spot_flow, fut_flow) if (spot_flow or fut_flow) else None
+        self.flow_ckpt = self._peaks()
+        return rec
+
+    def futures_outside_transfers(self):
+        """USDT moved into (+) or out of (-) the futures wallet by anything but the bot's own transfers since the
+        last look, from Binance's income history. Returns (amount, new bookmark), or (None, None) if unreadable."""
+        F = self.state.get("flow_fut") or {}
+        now_ms = self.server_ms()
+        if not F.get("ts"):
+            return 0.0, {"ts": now_ms, "used": []}  # first run: watch from now on
+        since = int(F["ts"])
+        try:
+            rows = []
+            for a, b in _chunks(since + 1, now_ms + 5000):
+                rows.extend(self.api.income(income_type="TRANSFER", start_time=a, end_time=b))
+        except (BinanceError, NetworkError) as e:
+            self.log.warning("futures transfer history: %s", e)
+            return None, None
+        rows = sorted((r for r in rows if r.get("incomeType") == "TRANSFER" and r.get("asset", "USDT") == "USDT"
+                       and int(r.get("time") or 0) > since), key=lambda r: int(r["time"]))
+        used = list(F.get("used") or [])
+        span = 2 * 3_600_000  # a transfer the bot could only confirm later is booked up to an hour after it ran
+        own = [t for t in self.store.read_all("transfers.jsonl")
+               if t.get("mode") == "live" and float(t.get("ts") or 0) * 1000 >= since - span and t.get("ts") not in used]
+        ext = 0.0
+        for r in rows:
+            amt, t_ms = float(r.get("income") or 0.0), int(r["time"])
+            mine = next((t for t in own if (t.get("to") == "futures") == (amt > 0)
+                         and abs(float(t["amount"]) - abs(amt)) < 0.011 and abs(float(t["ts"]) * 1000 - t_ms) <= span), None)
+            if mine:
+                own.remove(mine)
+                used.append(mine["ts"])
+            else:
+                ext += amt
+        # keep the bookmark close to now even when nothing happened, so the look-back never grows
+        mark = max([since, now_ms - 60_000] + [int(r["time"]) for r in rows])
+        return ext, {"ts": mark, "used": used[-50:]}
+
+    def book_flow(self, now, spot_flow, fut_flow, source="auto"):
+        """Outside money reached (+) or left (-) the wallets: take it out of every performance baseline, so
+        return and drawdown keep measuring the trading. The totals must already include the money."""
+        net = spot_flow + fut_flow
+        tot, sv, fv = self.total_equity()
+        ck = self.flow_ckpt or self._peaks()
+        T = self.state.setdefault("total", {})
+        k = 1.0
+        if abs(net) >= 0.005:
+            before = tot - net
+            if float(T.get("base") or 0) > 0 and before > 0 and tot > 0:
+                k = tot / before
+                T["base"] = float(T["base"]) * k
+                T["peak"] = max(float(ck["t"] or T.get("peak") or before) * k, tot)
+            elif tot > 0:  # nothing was there before: this money is the starting point
+                T.update(base=tot, since=now, peak=tot, mdd=0.0)
+            else:  # everything was taken out: there is nothing left to measure until money comes back
+                T.update(base=0.0, peak=0.0)
+            T["net_flow"] = float(T.get("net_flow") or 0.0) + net
+            T["last"] = tot
+            self.state["force_alloc"] = True  # split the new money (or the gap) at the next daily check
+        st = self.state["spot"]
+        if spot_flow:
+            st["net_in"] = float(st.get("net_in") or 0.0) + spot_flow
+        kf = self._scale_ledger(fv - fut_flow, fv, peak0=ck["l"] or None) if fut_flow else None
+        rec = {"ts": now, "mode": self.state["mode"], "spot": round(spot_flow, 2), "fut": round(fut_flow, 2),
+               "net": round(net, 2) + 0.0, "total": round(tot, 2), "src": source, "k": k, "kf": kf}
+        self.store.append("flows.jsonl", rec)
+        self.state["last_flow"] = rec
+        self.event("FLOW", msg=f"{net:+.2f} (현물 {spot_flow:+.2f}, 선물 {fut_flow:+.2f}, {source})")
+        self.flow_ckpt = self._peaks()
+        self.save()
+        self.send(self.flow_text(rec))
+        return rec
+
+    def flow_text(self, rec):
+        net, sp, fu = rec["net"], rec["spot"], rec["fut"]
+        if abs(net) < 0.005:  # the user moved money between the two wallets in the app
+            return (f"↔️ 앱에서 직접 옮긴 이체를 반영했습니다: 현물 {usd(sp)}, 선물 {usd(fu)}.\n"
+                    "총자산은 그대로라 수익률 계산은 바뀌지 않습니다. 배분은 다음 09:05 KST 점검 때 다시 봅니다.")
+        kind = "입금" if net > 0 else "출금"
+        where = " · ".join(x for x in (f"현물 {usd(sp)}" if sp else "", f"선물 {usd(fu)}" if fu else "") if x)
+        auto = rec.get("src") == "auto"
+        lines = [f"💵 {kind} {'감지' if auto else '기록'} — {usd(abs(net), False)} ({where})",
+                 f"수익률·최대낙폭은 이 금액을 {kind}으로 빼고 계산합니다. 배분은 다음 09:05 KST 점검 때 목표 비율로 맞춥니다."]
+        if auto:
+            lines.append(f"{kind}이 아니라면 /flows undo 로 취소할 수 있습니다.")
+        return "\n".join(lines)
+
+    def flow_reset(self):
+        """Watch for outside money from this moment on: what is in the wallets now is the new base (/rebase)."""
+        if self.spot is not None:
+            self.spot.state["flow_acc"] = 0.0
+        self.state["flow_fut"] = {"ts": self.server_ms(), "used": []} if self.state["mode"] == "live" else {}
+        self.state["last_flow"] = None
+        self.flow_ckpt = self._peaks()
 
     def daily_spot(self, now):
         if not self.spot_mode_ok():
@@ -732,10 +890,14 @@ class Trader:
         day = utc_day(now)
         self.state["hist_day"] = day
         h = self.state.setdefault("hist", [])
+        row = [day, round(sv, 4), round(fv, 4)]
+        base = float((self.state.get("total") or {}).get("base") or 0.0)
+        if base > 0 and sv + fv > 0:
+            row.append(round((sv + fv) / base, 6))  # unit price: total equity with deposits/withdrawals taken out
         if h and h[-1][0] == day:
-            h[-1] = [day, round(sv, 4), round(fv, 4)]
+            h[-1] = row
         else:
-            h.append([day, round(sv, 4), round(fv, 4)])
+            h.append(row)
         del h[:-1500]
 
     def total_equity(self):
@@ -1286,8 +1448,9 @@ class Trader:
         except (BinanceError, NetworkError) as e:
             self.log.warning("monthly report BTC prices: %s", e)
             btc = None
+        flows = [f for f in self.store.read_all("flows.jsonl") if f.get("mode") == self.state["mode"]]
         return RP.monthly_text(label, self.mode_ko(), self.state.get("hist") or [], start, end, trades, js[-30:],
-                               len(fills), btc)
+                               len(fills), btc, flows)
 
     def worst_case(self):
         tot = 0.0
@@ -1436,6 +1599,7 @@ class Trader:
             "⚖️ /alloc 현물/선물 배분 (/alloc 50 = 현물 50%)\n🎚 /preset 안정·기본·공격 위험 단계(불타기 포함)\n"
             "🔎 /scan 선물 종목별 신호 상태\n📜 /log 최근 판단 기록\n📁 /export 거래기록 CSV(세금 신고용)\n"
             "📅 /report 지난달 리포트 (/report 이번달) — 매월 1일 자동 발송\n"
+            "💵 /flows 입금·출금 기록 (실전은 자동 감지 · 놓친 것은 /deposit 100, /withdraw 100)\n"
             "⏸ /pause 신규 진입 정지 · ▶️ /resume 재개\n"
             "/close BTC 한 종목 청산 · /closeall 전체 청산\n"
             "/risk 3 — 1회 위험(%) 변경 · /settings 설정 보기 · /set 키 값\n"
@@ -1487,7 +1651,10 @@ class Trader:
             base = float(T.get("base") or 0)
             if base:
                 since = kst(float(T.get("since") or now)).strftime("%Y-%m-%d")
-                lines.append(f"[전체] {usd(tot, False)} — {since} 기준 {usd(base, False)} 대비 {(tot / base - 1) * 100:+.1f}% "
+                net = float(T.get("net_flow") or 0.0)
+                how = (f"{since} 기준 {usd(base, False)} 대비" if abs(net) < 0.005
+                       else f"{since} 이후 수익률(순입금 {usd(net)} 제외)")
+                lines.append(f"[전체] {usd(tot, False)} — {how} {(tot / base - 1) * 100:+.1f}% "
                              f"| 최대낙폭 {float(T.get('mdd') or 0):.1f}%")
             net_in = float(self.state["spot"].get("net_in") or 0)
             n_sp = len([t for t in self.store.read_all("spot_trades.jsonl") if t.get("mode") == self.state["mode"]])
@@ -1629,6 +1796,14 @@ class Trader:
                              kst(t["ts"]).strftime("%Y-%m-%d %H:%M"), t.get("mode"), t.get("asset", "USDT"),
                              "현물→유연 예치" if t.get("kind") == "subscribe" else "유연 예치→현물", "", "",
                              t.get("amount"), "", "", f"{t.get('why', '')} · 번호 {t.get('id')}"])
+        for t in self.store.read_all("flows.jsonl"):
+            if keep(t.get("ts", 0)):
+                net = float(t.get("net") or 0.0)
+                kind = "지갑간 이동" if abs(net) < 0.005 else ("입금" if net > 0 else "출금")
+                if t.get("src") == "undo":
+                    kind += "(기록 취소)"
+                rows.append(["입출금", kst(t["ts"]).strftime("%Y-%m-%d %H:%M"), t.get("mode"), "USDT", kind, "", "",
+                             t.get("net"), "", "", f"현물 {t.get('spot')} · 선물 {t.get('fut')} · {t.get('src')}"])
         if len(rows) == 1:
             self.send("내보낼 기록이 없습니다.")
             return
@@ -1638,7 +1813,7 @@ class Trader:
         csv.writer(buf).writerows(rows)
         data = ("\ufeff" + buf.getvalue()).encode("utf-8")  # BOM so Excel/Numbers open Korean correctly
         name = f"trendhunter_{year or 'all'}.csv"
-        ok = self.tg.send_document(name, data, caption=f"거래기록 {len(rows) - 1}건 (선물 청산·현물 체결·지갑 이체)") \
+        ok = self.tg.send_document(name, data, caption=f"거래기록 {len(rows) - 1}건 (선물 청산·현물 체결·지갑 이체·입출금)") \
             if self.tg and hasattr(self.tg, "send_document") else None
         if not ok:
             self.send("⚠️ 파일 전송에 실패했습니다. 잠시 뒤 다시 시도하세요.")
@@ -1650,6 +1825,106 @@ class Trader:
         else:
             start, end, label = RP.prev_month(now)
         self.send(self.monthly_text(start, end, label))
+
+    def cmd_deposit(self, args):
+        self._flow_cmd(args, +1)
+
+    def cmd_withdraw(self, args):
+        self._flow_cmd(args, -1)
+
+    def _flow_cmd(self, args, sign):
+        word, cmd = ("입금", "deposit") if sign > 0 else ("출금", "withdraw")
+        try:
+            amt = float(args[0].replace(",", "").lstrip("$"))
+            if not 0 < amt < 1e9:
+                raise ValueError
+        except (IndexError, ValueError):
+            self.send(f"사용법: /{cmd} 100  (USDT 금액). 선물 지갑에 직접 넣고 뺀 돈이면 /{cmd} 100 선물\n"
+                      f"실전 모드에서는 {word}을 봇이 10분 안에 스스로 알아챕니다. 이 명령은 놓친 것을 적어 넣을 때만 쓰세요.")
+            return
+        wallet = "fut" if len(args) > 1 and args[1].lower() in ("선물", "futures", "fut") else "spot"
+        where = "현물" if wallet == "spot" else "선물"
+        if not (self.cfg.get("spot_enabled", True) and self.spot_ready and self.spot_mode_ok()):
+            self.send("현물 모듈이 준비되지 않아 기록할 수 없습니다. /selftest 로 점검해 주세요.")
+            return
+        if self.state["mode"] != "live":
+            self.confirm(f"모의 모드: 가상으로 {usd(amt, False)}을 {where} 지갑에 {word}할까요?", "flow", sign * amt, wallet)
+            return
+        if self.flow_pass(self.now(), force=True):
+            self.send("ℹ️ 방금 확인에서 위 내용을 자동으로 반영했습니다. 따로 더 기록하지 않았습니다.")
+            return
+        self.confirm(f"자동으로 감지된 {word}이 없습니다. 그래도 {usd(amt, False)}을 {where} 지갑 {word}으로 기록할까요?\n"
+                     "수익률 계산에만 반영하고 돈은 움직이지 않습니다. 이미 반영된 금액을 또 적으면 수익률이 틀어집니다.",
+                     "flow", sign * amt, wallet)
+
+    def act_flow(self, amount, wallet):
+        if not (self.spot_ready and self.spot_mode_ok()):
+            self.send("현물 모듈이 준비되지 않아 기록하지 못했습니다.")
+            return
+        if self.state["mode"] != "live":  # paper: the virtual money really moves
+            if wallet == "spot":
+                if self.spot.value(refresh=True)["usdt_free"] + amount < 0:
+                    self.send("가상 현물 지갑의 USDT가 그만큼 없습니다.")
+                    return
+                self.spot.ex.adjust_usdt(amount)
+            else:
+                if self.broker.equity()["available"] + amount < 0:
+                    self.send("가상 선물 지갑의 여유 잔고가 그만큼 없습니다.")
+                    return
+                self.broker.adjust_balance(amount)
+                self.state["equity"] = self.broker.equity()["equity"]
+            self.spot.mark_own()
+        self.spot.value(refresh=True)
+        self.book_flow(self.now(), amount if wallet == "spot" else 0.0, amount if wallet == "fut" else 0.0, "manual")
+
+    def cmd_flows(self, args):
+        if args and args[0].lower() in ("undo", "취소"):
+            last = self.state.get("last_flow")
+            if not last or last.get("mode") != self.state["mode"]:
+                self.send("취소할 기록이 없습니다(가장 최근 기록 하나만 취소할 수 있습니다).")
+                return
+            self.confirm(f"마지막 기록({kst(last['ts']).strftime('%m/%d %H:%M')}, {usd(last['net'])})을 취소할까요? "
+                         "수익률 계산이 그 기록 전 상태로 돌아갑니다.", "flow_undo")
+            return
+        rows = [f for f in self.store.read_all("flows.jsonl") if f.get("mode") == self.state["mode"]]
+        if not rows:
+            self.send("기록된 입금·출금이 없습니다. 실전 모드에서는 봇이 10분 안에 스스로 알아채 기록합니다.\n"
+                      "놓친 것 적기: /deposit 100 · /withdraw 100")
+            return
+        tag = {"auto": "자동", "manual": "수동", "undo": "취소"}
+        lines = ["💵 입금·출금 기록 (최근 10건)"]
+        for f in rows[-10:]:
+            lines.append(f"  {kst(f['ts']).strftime('%m/%d %H:%M')} {usd(f['net'])} (현물 {usd(f['spot'])}, 선물 {usd(f['fut'])}) "
+                         f"· {tag.get(f.get('src'), f.get('src'))}")
+        T = self.state.get("total") or {}
+        lines.append(f"기준점 이후 순입금 {usd(float(T.get('net_flow') or 0.0))} — 수익률은 이 금액을 빼고 계산합니다.")
+        lines.append("잘못 잡힌 마지막 기록 취소: /flows undo · 놓친 것 적기: /deposit 100, /withdraw 100")
+        self.send("\n".join(lines))
+
+    def act_flow_undo(self):
+        last = self.state.get("last_flow")
+        if not last or last.get("mode") != self.state["mode"]:
+            self.send("취소할 기록이 없습니다.")
+            return
+        T = self.state.setdefault("total", {})
+        k, kf = float(last.get("k") or 1.0), last.get("kf")
+        if k > 0 and float(T.get("base") or 0) > 0:
+            T["base"] = float(T["base"]) / k
+            T["peak"] = float(T.get("peak") or 0.0) / k
+        T["net_flow"] = float(T.get("net_flow") or 0.0) - float(last["net"])
+        st = self.state["spot"]
+        st["net_in"] = float(st.get("net_in") or 0.0) - float(last["spot"])
+        if kf and self.ledger:
+            for key in ("start_equity", "peak_equity", "day_start_equity"):
+                self.ledger[key] = float(self.ledger.get(key) or 0.0) / kf
+        rec = {"ts": self.now(), "mode": self.state["mode"], "spot": -last["spot"], "fut": -last["fut"],
+               "net": -last["net"], "total": last.get("total"), "src": "undo"}
+        self.store.append("flows.jsonl", rec)
+        self.state["last_flow"] = None
+        self.event("FLOW", msg=f"undo {last['net']:+.2f}")
+        self.flow_ckpt = self._peaks()
+        self.save()
+        self.send(f"↩️ 마지막 기록({usd(last['net'])})을 취소했습니다. 수익률 계산이 그 전 상태로 돌아갔습니다.")
 
     def cmd_scan(self, args):
         lines = ["🔎 스캔 (마지막 마감봉 기준)"]
@@ -1761,7 +2036,7 @@ class Trader:
                 "pyramid_max_adds", "pyramid_step_r", "pyramid_risk_frac", "liq_buffer_mult",
                 "max_entries_per_day", "daily_loss_limit_pct", "loss_streak_limit", "loss_streak_pause_hours",
                 "cooldown_after_loss_hours", "equity_floor_pct", "time_stop_hours", "adx_min",
-                "brief_morning_kst", "brief_evening_kst", "monthly_report", "update_url"]
+                "brief_morning_kst", "brief_evening_kst", "monthly_report", "flow_detect", "update_url"]
         lines = ["⚙️ 설정 (변경: /set 키 값)"]
         for k in keys:
             v = self.cfg.get(k)
@@ -1857,7 +2132,9 @@ class Trader:
                 self.state["spot"]["net_in"] = sv
                 tot = eq + sv
                 self.state["total"] = {"base": tot, "since": self.now(), "peak": tot, "mdd": 0.0, "last": tot}
-                extra = f"\n총자산 기준점 {usd(tot, False)} (현물 {usd(sv, False)} + 선물 {usd(eq, False)}) — 입금·출금 뒤에 쓰세요."
+                self.flow_reset()  # what is in the wallets now is the base: it must not be booked as a deposit later
+                extra = (f"\n총자산 기준점 {usd(tot, False)} (현물 {usd(sv, False)} + 선물 {usd(eq, False)}). "
+                         "수익률을 지금부터 새로 재고 싶을 때 쓰세요. 입금·출금은 봇이 스스로 반영합니다.")
             except (BinanceError, NetworkError) as e:
                 extra = f"\n⚠️ 현물 평가 실패로 총자산 기준점은 그대로입니다: {e}"
         self.save()
@@ -1918,7 +2195,11 @@ class Trader:
     def reset_spot_mode(self, mode):
         """Start the spot sleeve over for a new mode: fresh state, fresh paper wallet, fresh back-end."""
         st = self.state.setdefault("spot", {})
-        st.update(last_day=None, net_in=None, targets={}, diag={}, fails=0, retry_at=0.0, last_trades=[], earn={})
+        st.update(last_day=None, net_in=None, targets={}, diag={}, fails=0, retry_at=0.0, last_trades=[], earn={},
+                  snap=None, flow_acc=0.0, own_until=0.0)
+        self.state["flow_fut"] = {}
+        self.state["last_flow"] = None
+        self.flow_ckpt = None
         self.state["total"] = {}
         self.state["hist"] = []
         self.state["hist_day"] = None
@@ -2064,6 +2345,9 @@ class Trader:
                 finally:
                     self.spot_busy = False
                     if self.spot is not None:
+                        # not marked as the bot's own move on purpose: the test buys and sells the same amount and
+                        # moves the same USDT there and back, so the flow check sees zero — and if the test broke
+                        # half-way, it correctly sees money that changed wallets
                         self.spot.cache = None
                 self.send(out2["text"])
 
@@ -2227,6 +2511,8 @@ def check(data_dir):
         raise SystemExit("bad spot_btc_gate_min (0~1)")
     if not isinstance(cfg["spot_earn"], bool):
         raise SystemExit("bad spot_earn (true/false)")
+    if not isinstance(cfg.get("flow_detect"), bool):
+        raise SystemExit("bad or missing flow_detect (true/false)")
     if isinstance(cfg["spot_cash_yield"], bool) or not isinstance(cfg["spot_cash_yield"], (int, float)) \
             or not 0 <= cfg["spot_cash_yield"] <= 0.3:
         raise SystemExit("bad spot_cash_yield (0~0.3)")
