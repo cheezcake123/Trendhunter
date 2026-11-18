@@ -504,8 +504,10 @@ class Trader:
 
     def guard_equity(self, equity):
         """Futures equity for the equity floor: the lower of the real balance and the judged one. A drop that may be
-        a withdrawal or a loss reaches the floor at once; a rise is only believed once it is judged."""
-        return float(equity) - max(self.fut_gap(), 0.0)
+        a withdrawal or a loss reaches the floor at once; a rise is only believed once it is judged — also when a
+        loss came after it (the largest rise since the last finished look is left out)."""
+        rise = float((self.state.get("flow_fut") or {}).get("rise") or 0.0) if self.flow_on() else 0.0
+        return float(equity) - max(self.fut_gap(), rise, 0.0)
 
     def note_equity(self, eq):
         self.state["equity"], self.state["available"] = eq["equity"], eq["available"]
@@ -836,9 +838,10 @@ class Trader:
         self.note_equity(eq)
         w = float(eq["wallet"])
         if F.get("seen") is None or not F.get("ts"):  # first look: watch from now on
-            F.update(ts=self.server_ms(), own=[], ids=[], seen=w, since=None, checked=now, blocked=None)
+            F.update(ts=self.server_ms(), own=[], ids=[], seen=w, since=None, checked=now, blocked=None, rise=0.0)
             return "idle"
         gap = w - float(F["seen"])
+        F["rise"] = max(float(F.get("rise") or 0.0), gap)  # the floor never counts on a rise not yet judged
         big = abs(gap) >= self._flow_big(eq)
         spot_on = bool(self.cfg.get("spot_enabled", True))
         sp = self.spot if spot_on and self.spot_ready and self.spot_mode_ok() else None
@@ -884,15 +887,22 @@ class Trader:
         else:
             ext, other, own, ids, mark = inc
             resid = gap - ext - other
+            released = False
             if abs(resid) >= self._flow_big(eq):  # the rows do not (yet) explain the change
                 F["since"] = F.get("since") or now
                 if now - float(F["since"]) < FLOW_RELEASE_S:
                     return "wait"  # rows can show up late: the same rows are read again at the next step
                 self.event("FLOW", msg=f"futures wallet change {resid:+.2f} without income rows: counted as a result")
+                released = True
             if abs(ext) >= 0.005 and (spot_err or (spot_on and sp is None)):
                 # outside money on the futures side; the other wallet has to be seen too (the rows are read again)
                 return self._flow_blocked(F, now, sp, spot_err or "현물 모듈 준비 중")
-            F.update(ts=mark, own=own, ids=ids, seen=w, since=None, checked=now, blocked=None)
+            if released:  # all of the wallet up to now is judged: a row of that time that turns up later is skipped
+                mark, ids = max(mark, self.server_ms()), []
+            if F.get("gave_up") and self.state.get("floor_alerted"):
+                self.send("ℹ️ 바이낸스 선물 기록을 다시 읽을 수 있습니다. 기록을 못 읽던 동안 선물 지갑에서 넣거나 뺀 돈이 "
+                          "있었다면 /deposit 금액 선물 · /withdraw 금액 선물 로 적어 주세요(자본 바닥선 기준이 바로잡힙니다).")
+            F.update(ts=mark, own=own, ids=ids, seen=w, since=None, checked=now, blocked=None, rise=0.0, gave_up=None)
         if spot_err:  # the futures side is judged; the spot wallet waits for the next try
             return self._flow_blocked(F, now, sp, spot_err)
         # 4. the whole picture is there
@@ -931,12 +941,16 @@ class Trader:
     def _flow_give_up(self, F, now, w, gap):
         """The income history stayed unreadable for a day: what the futures wallet did meanwhile counts as results
         from here on. The bookmark moves to now, so rows of that time can never be booked twice later."""
-        F.update(ts=self.server_ms(), own=[], ids=[], seen=w, since=None, checked=now, blocked=None)
+        rise = float(F.get("rise") or 0.0)
+        F.update(ts=self.server_ms(), own=[], ids=[], seen=w, since=None, checked=now, blocked=None, rise=0.0,
+                 gave_up=now)
         self.event("FLOW", msg=f"income history unreadable for a day: futures change {gap:+.2f} counted as results")
-        if abs(gap) >= 1.0:
-            self.send(f"⚠️ 하루 동안 바이낸스 선물 손익 기록을 읽지 못해, 그동안 설명하지 못한 선물 지갑 변화 {usd(gap)}를 "
+        if abs(gap) >= 1.0 or rise >= 1.0:
+            most = f" (가장 컸을 때 {usd(rise)})" if rise >= gap + 1.0 else ""
+            self.send(f"⚠️ 하루 동안 바이낸스 선물 손익 기록을 읽지 못해, 그동안 설명하지 못한 선물 지갑 변화 {usd(gap)}{most}를 "
                       "매매 결과로 처리했습니다.\n그사이 선물 지갑에 직접 넣거나 뺀 돈이 있었다면 "
-                      "/deposit 금액 선물 (또는 /withdraw 금액 선물) 로 적어 주세요.")
+                      "/deposit 금액 선물 · /withdraw 금액 선물 로 적어 주세요. 지금 바로 적을 수 있고, 자본 바닥선 기준도 "
+                      "그에 맞춰 바로잡힙니다.")
 
     def fut_gap(self):
         """What the futures wallet did since the balance the books judged last (flow_pass)."""
@@ -2129,6 +2143,8 @@ class Trader:
         if res == "booked":
             self.send("ℹ️ 방금 확인에서 위 내용을 자동으로 반영했습니다. 따로 더 기록하지 않았습니다.")
             return False
+        if res == "unread" and (self.state.get("flow_fut") or {}).get("gave_up"):
+            return True  # the rows of the unreadable day are skipped for good: a record cannot be booked twice
         if res in ("wait", "blocked", "unread"):
             self.send("⏳ 지금은 지갑 변화를 확인하는 중이라 직접 기록할 수 없습니다(이체 확인 중이거나 바이낸스 기록을 "
                       "읽지 못함). 확인이 끝나면 봇이 자동으로 반영합니다. 몇 분 뒤 /flows 로 확인해 주세요.")

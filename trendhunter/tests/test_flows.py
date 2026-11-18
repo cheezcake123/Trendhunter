@@ -821,6 +821,57 @@ class Unclear(Base):
         eq = tr.broker.equity()["equity"]
         self.assertLess(tr.guard_equity(eq), eq - 25.0)
 
+    def test_a_loss_after_an_unconfirmed_deposit_still_reaches_the_floor(self):
+        tr, tg, store = self.settled()
+        fv0 = tr.state["equity"]
+        self.fake.income_fail = True
+        self.fake.outside_futures(round(fv0 * 0.8, 2))  # a deposit that cannot be confirmed yet ...
+        self.tick(tr, 2)
+        self.fake.wallet -= fv0 * 0.7  # ... and then a loss: the real balance is still above the old floor
+        self.tick(tr, 1)
+        eq = tr.broker.equity()["equity"]
+        floor = tr.ledger["start_equity"] * tr.cfg["equity_floor_pct"] / 100.0
+        self.assertGreater(eq, floor, "the real balance alone would not trip the floor")
+        self.assertEqual(B.R.account_guard(tr.ledger, self.clock(), tr.guard_equity(eq), tr.cfg), "EQUITY_FLOOR",
+                         "the loss is not netted against money that may just have been put in")
+
+    def test_withdrawal_during_a_long_outage_can_be_recorded_after_the_give_up(self):
+        tr, tg, store = self.settled()
+        out = round(self.fake.wallet * 0.6, 2)
+        self.fake.income_fail = True
+        self.fake.outside_futures(-out)
+        self.tick(tr, 3)
+        eq = tr.broker.equity()["equity"]
+        self.assertEqual(B.R.account_guard(tr.ledger, self.clock(), tr.guard_equity(eq), tr.cfg), "EQUITY_FLOOR",
+                         "fails safe while it cannot be told")
+        self.run_for(tr, 25 * 3600, step=300)
+        self.assertTrue(any("지금 바로 적을 수 있고" in t for t in tg.texts()))
+        say(tr, f"/withdraw {out} 선물")  # what the message asks for, while the history is still down
+        press_ok(tr, tg)
+        self.assertEqual([(f["fut"], f["src"]) for f in store.read_all("flows.jsonl")], [(-out, "manual")])
+        eq = tr.broker.equity()["equity"]
+        self.assertIsNone(B.R.account_guard(tr.ledger, self.clock(), tr.guard_equity(eq), tr.cfg))
+        self.fake.income_fail = False
+        self.run_for(tr, 3600)
+        self.assertEqual(len(store.read_all("flows.jsonl")), 1, "the row of the outage is never booked on top")
+
+    def test_second_change_during_a_wait_is_not_booked_twice(self):
+        tr, tg, store = self.settled()
+        start0 = tr.ledger["start_equity"]
+        self.fake.wallet += 20.0              # no row is ever written for this one
+        self.tick(tr, 15)                     # five minutes into the wait ...
+        self.fake.income_lag_s = 13 * 60
+        self.fake.outside_futures(15.0)       # ... a deposit whose row shows up only after the release
+        self.run_for(tr, 3600, step=20)
+        self.assertEqual(tr.held(), 0.0)
+        # both were counted as results at the release (a known trade-off for rows that late); what must never
+        # happen is the deposit being booked on top afterwards, scaling baselines that already contain it
+        self.assertEqual(store.read_all("flows.jsonl"), [])
+        self.assertAlmostEqual(tr.ledger["start_equity"], start0, delta=start0 * 1e-6)
+        self.fake.income_lag_s = 0.0
+        self.run_for(tr, 3600)
+        self.assertEqual(store.read_all("flows.jsonl"), [], "nothing booked on top afterwards")
+
     def test_unexplained_change_is_let_through_after_a_day_at_the_latest(self):
         tr, tg, store = self.settled()
         self.fake.income_fail = True
