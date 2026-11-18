@@ -101,7 +101,7 @@ class OwnMoves(Base):
         self.assertEqual(store.read_all("flows.jsonl"), [])
         self.assertFalse(any("입금" in t and "감지" in t or "출금 감지" in t or "직접 옮긴" in t for t in tg.texts()))
         self.assertAlmostEqual(float(tr.state["total"].get("net_flow") or 0.0), 0.0)
-        self.assertEqual(tr.state.get("flow_hold"), 0.0)
+        self.assertEqual(tr.held(), 0.0)
 
     def test_the_real_main_loop_through_daily_jobs_and_futures_trades(self):
         """20-second steps (the pace of the real loop) across two daily jobs, with Earn on: every window between
@@ -113,7 +113,7 @@ class OwnMoves(Base):
         def ticks(n):
             for _ in range(n):
                 self.tick(tr, 1)
-                held.append(abs(tr.state.get("flow_hold") or 0.0))
+                held.append(abs(tr.held()))
 
         ticks(90)  # the first job (split, buys, parking) and half an hour after it
         for alloc in (70.0, 35.0):
@@ -124,7 +124,7 @@ class OwnMoves(Base):
         self.assertGreaterEqual(len(store.read_all("transfers.jsonl")), 3)
         self.assertGreaterEqual(len(store.read_all("earn.jsonl")), 2)
         self.assertEqual(store.read_all("flows.jsonl"), [])
-        self.assertEqual(tr.state.get("flow_hold"), 0.0)
+        self.assertEqual(tr.held(), 0.0)
         self.assertLess(abs(tr.state["spot"]["flow_acc"]), 0.5)
 
     def test_alloc_change_and_preset_are_not_flows(self):
@@ -223,6 +223,60 @@ class OwnMoves(Base):
         self.run_for(tr, DAY + 3600)
         self.assertEqual(store.read_all("flows.jsonl"), [], "the bot's own Earn move, whatever the answer")
 
+    def test_earn_redemption_with_lost_answer_that_lands_slowly(self):
+        tr, tg, store = self.make(over={"spot_earn": True})
+        tr.startup()
+        self.run_for(tr, DAY)
+        self.assertGreater(self.fake.earn_usdt, 5.0)
+        r0 = self.ret(tr)
+        self.fake.earn_drop_response = 1
+        self.fake.earn_redeem_delay = 150.0
+        tr.act_alloc(15.0)  # parked money is needed for the futures wallet
+        self.tick(tr, 2)
+        self.assertEqual(self.fake.earn_drop_response, 0, "carried out, answer lost")
+        self.assertTrue(self.fake.earn_landing, "still on its way")
+        self.assertAlmostEqual(self.ret(tr), r0, delta=0.02, msg="no dip while it is on its way")
+        self.run_for(tr, DAY + 3600)
+        self.assertEqual(store.read_all("flows.jsonl"), [], "neither a withdrawal nor a deposit")
+        self.assertAlmostEqual(tr.spot.state["earn"].get("transit"), 0.0, places=6)
+
+    def test_earn_redemption_that_failed_with_unknown_answer_changes_nothing(self):
+        tr, tg, store = self.make(over={"spot_earn": True})
+        tr.startup()
+        self.run_for(tr, DAY)
+        parked = self.fake.earn_usdt
+        real = tr.spot.ex.earn_redeem
+
+        def lost(*a, **kw):
+            raise NetworkError("simulated timeout")  # never reached Binance
+
+        tr.spot.ex.earn_redeem = lost
+        tr.act_alloc(15.0)
+        self.tick(tr, 2)
+        tr.spot.ex.earn_redeem = real
+        self.assertAlmostEqual(self.fake.earn_usdt, parked)
+        self.run_for(tr, DAY + 3600)
+        self.assertEqual(store.read_all("flows.jsonl"), [])
+        self.assertIsNone(tr.spot.state["earn"].get("maybe_redeem"))
+        self.assertEqual(tr.spot.state["earn"].get("transit") or 0.0, 0.0)
+
+    def test_money_moved_while_earn_cannot_be_read_is_one_move(self):
+        tr, tg, store = self.make(over={"spot_earn": True})
+        tr.startup()
+        self.run_for(tr, DAY)
+        self.fake.outside_deposit(20.0)  # idle USDT in the spot wallet ...
+        self.run_for(tr, 1200)
+        self.assertEqual(self.nets(store), [20.0])
+        self.fake.earn_fail_read = True
+        self.fake.app_transfer(15.0, to_futures=True)  # ... that the user moves to futures while Earn is down
+        self.run_for(tr, 1800, step=20)
+        self.assertEqual(self.nets(store), [20.0], "the futures side alone is not booked")
+        self.fake.earn_fail_read = False
+        self.run_for(tr, 1200)
+        flows = store.read_all("flows.jsonl")
+        self.assertEqual(len(flows), 2)
+        self.assertEqual((flows[1]["fut"], flows[1]["net"]), (15.0, 0.0))
+
     def test_earn_subscription_that_went_through_but_lost_its_answer(self):
         tr, tg, store = self.make(over={"spot_earn": True})
         tr.startup()
@@ -312,7 +366,7 @@ class OwnMoves(Base):
         self.fake.app_transfer(7.0, to_futures=False)
         self.tick(tr, 2)
         self.assertEqual(store.read_all("flows.jsonl"), [])
-        self.assertAlmostEqual(tr.state["flow_hold"], -7.0, delta=0.01, msg="kept out of the guards' sight")
+        self.assertAlmostEqual(tr.held(), -7.0, delta=0.01, msg="kept out of the guards' sight")
         self.fake.app_transfer(7.0, to_futures=True)  # ... and back
         tr.spot_busy = False
         tr.spot.cache = None
@@ -426,7 +480,7 @@ class Detection(Base):
         self.assertAlmostEqual(tr.state["spot"]["net_in"], in0 - x, delta=0.03)
         self.assertAlmostEqual(tr.ledger["start_equity"] / start0, (fv0 + x) / fv0, delta=0.02,
                                msg="the futures floor baseline follows the money")
-        self.assertTrue(any(t.startswith("↔️ 앱에서 직접 옮긴") for t in tg.texts()))
+        self.assertTrue(any(t.startswith("↔️ 현물↔선물 지갑 사이를 오간 돈") for t in tg.texts()))
         self.assertFalse(tr.state.get("force_alloc"), "a move between the wallets is not new money to split")
 
     def test_outside_money_into_the_futures_wallet_never_reaches_the_guards_unbooked(self):
@@ -515,6 +569,50 @@ class Detection(Base):
         self.run_for(tr, 1200)
         self.assertEqual(self.nets(store), [15.0])
 
+    def test_switched_off_while_watching_and_on_again(self):
+        tr, tg, store = self.settled()
+        say(tr, "/set flow_detect false")
+        self.fake.outside_deposit(30.0)
+        self.fake.app_transfer(8.0, to_futures=True)
+        self.fake.outside_futures(12.0)
+        self.run_for(tr, 3600)
+        say(tr, "/set flow_detect true")
+        self.run_for(tr, 3600)
+        self.assertEqual(store.read_all("flows.jsonl"), [], "what happened while it was off is not judged afterwards")
+        self.fake.outside_deposit(15.0)
+        self.run_for(tr, 1200)
+        self.assertEqual(self.nets(store), [15.0])
+
+    def test_switching_off_while_something_is_waiting_says_so(self):
+        tr, tg, store = self.settled()
+        self.fake.income_fail = True
+        self.fake.outside_futures(25.0)
+        self.tick(tr, 2)
+        self.assertAlmostEqual(tr.held(), 25.0, delta=0.5)
+        say(tr, "/set flow_detect false")
+        self.assertIn("반영하지 않고 넘깁니다", tg.texts()[-1])
+        self.assertIn("+$25.00", tg.texts()[-1])
+
+    def test_restart_on_v25_after_running_v24_for_a_while(self):
+        """/rollback to v2.4 and /update again: v2.4 knew nothing of the watch, so it starts afresh."""
+        tr, tg, store = self.settled()
+        tr.save()
+        st = store.load_state()
+        st["seen_version"] = "2.4.0"  # what v2.4 writes
+        store.save_state(st)
+        # what v2.4 did meanwhile: its own transfer and trades, invisible to the v2.5 bookkeeping
+        self.fake.app_transfer(9.0, to_futures=False)
+        self.fake.outside_deposit(-3.0, asset="USDT")
+        self.fake.outside_deposit(0.05, asset="AAA")
+        self.clock.advance(2 * DAY)
+        tr2, tg2, store2 = make_trader(self.fake, self.clock, self.tmp, spot=True)
+        tr2.startup()
+        self.run_for(tr2, 3600)
+        self.assertEqual(store2.read_all("flows.jsonl"), [])
+        self.fake.outside_deposit(15.0)
+        self.run_for(tr2, 1200)
+        self.assertEqual(self.nets(store2), [15.0])
+
     def test_deposit_while_the_bot_was_down(self):
         tr, tg, store = self.settled()
         r0 = self.ret(tr)
@@ -555,7 +653,7 @@ class Unclear(Base):
         self.fake.outside_futures(30.0)
         self.tick(tr, 3)
         self.assertEqual(store.read_all("flows.jsonl"), [], "both wallets are judged together or not at all")
-        self.assertAlmostEqual(tr.state["flow_hold"], 30.0, delta=0.5)
+        self.assertAlmostEqual(tr.held(), 30.0, delta=0.5)
         self.assertAlmostEqual(tr.guard_equity(tr.state["equity"]), fv0, delta=fv0 * 0.02)
         self.assertAlmostEqual(tr.ledger["start_equity"], L0["start_equity"])
         self.assertLessEqual(tr.ledger["peak_equity"], max(L0["peak_equity"], fv0 * 1.02), "not a new peak")
@@ -576,7 +674,7 @@ class Unclear(Base):
         self.fake.income_fail = False
         self.tick(tr, 4)
         self.assertEqual([(f["spot"], f["fut"], f["net"]) for f in store.read_all("flows.jsonl")], [(50.0, 30.0, 80.0)])
-        self.assertEqual(tr.state["flow_hold"], 0.0)
+        self.assertEqual(tr.held(), 0.0)
         fv = tr.state["equity"]
         self.assertAlmostEqual(tr.ledger["start_equity"] / L0["start_equity"], fv / (fv - 30.0), delta=0.02)
         self.assertAlmostEqual(tr.ledger["day_start_equity"], fv, delta=fv * 0.05)
@@ -593,24 +691,92 @@ class Unclear(Base):
         self.fake.outside_futures(20.0)
         self.tick(tr, 2)
         self.assertEqual(store.read_all("flows.jsonl"), [])
-        self.assertAlmostEqual(tr.state["flow_hold"], 20.0, delta=0.5, msg="unexplained: waits for its row")
+        self.assertAlmostEqual(tr.held(), 20.0, delta=0.5, msg="unexplained: waits for its row")
         self.assertLess(tr.ledger["peak_equity"], fv0 * 1.03)
         self.tick(tr, 1)
         self.assertEqual(self.nets(store), [20.0])
-        self.assertEqual(tr.state["flow_hold"], 0.0)
+        self.assertEqual(tr.held(), 0.0)
         self.assertAlmostEqual(self.ret(tr), r0, delta=0.01)
 
-    def test_income_row_later_than_the_wait_is_still_booked_once(self):
+    def late_rows(self, lag, move):
+        """Income rows show up `lag` seconds late; `move` changes the wallets. Returns the trader after the rows
+        arrived and were booked, with the state before the move."""
         tr, tg, store = self.settled()
-        start0, fv0 = tr.ledger["start_equity"], tr.state["equity"]
-        self.fake.income_lag_s = 240.0
-        self.fake.outside_futures(20.0)
-        self.tick(tr, 5)
+        fv0 = tr.state["equity"]
+        tr.ledger["peak_equity"] = fv0  # the futures wallet and the total stand at their peaks
+        tr.state["total"]["peak"] = tr.total_equity()[0]
+        before = {"r": self.ret(tr), "fv": fv0, "L": dict(tr.ledger), "dd": tr.state["max_dd"],
+                  "mdd": tr.state["total"]["mdd"]}
+        self.fake.income_lag_s = lag
+        move()
+        self.tick(tr, int(lag / 20) - 2)
+        self.assertEqual(store.read_all("flows.jsonl"), [], "the rows are not there yet")
+        self.assertNotEqual(tr.held(), 0.0, "still waiting for its rows")
+        self.tick(tr, 6)
+        return tr, tg, store, before
+
+    def assert_figures_kept(self, tr, before, fut):
+        self.assertAlmostEqual(self.ret(tr), before["r"], delta=0.01)
+        fv = tr.state["equity"]
+        self.assertAlmostEqual(tr.ledger["start_equity"] / before["L"]["start_equity"], fv / (fv - fut), delta=0.02)
+        self.assertAlmostEqual(tr.ledger["peak_equity"] / before["L"]["peak_equity"], fv / (fv - fut), delta=0.03,
+                               msg="the peak is scaled once, not raised by the money first")
+        self.assertGreater(tr.state["max_dd"], before["dd"] - 3.0, "no drawdown from money that left")
+        self.assertGreater(tr.state["total"]["mdd"], before["mdd"] - 3.0)
+        tot = tr.total_equity()[0]
+        self.assertGreater((tot - tr.state["total"]["peak"]) / tr.state["total"]["peak"], -0.03)
+        self.assertEqual(tr.held(), 0.0)
+
+    def test_deposit_whose_row_is_minutes_late(self):
+        tr, tg, store, before = self.late_rows(240.0, lambda: self.fake.outside_futures(50.0))
+        self.assertEqual(self.nets(store), [50.0])
+        self.assert_figures_kept(tr, before, 50.0)
+        self.run_for(tr, 3600)
+        self.assertEqual(len(store.read_all("flows.jsonl")), 1)
+
+    def test_withdrawal_whose_row_is_minutes_late(self):
+        out = []
+
+        def move():
+            out.append(round(self.fake.wallet * 0.6, 2))  # below the floor if it were a loss
+            self.fake.outside_futures(-out[0])
+
+        tr, tg, store, before = self.late_rows(240.0, move)
+        self.assertEqual(self.nets(store), [-out[0]])
+        self.assert_figures_kept(tr, before, -out[0])
+        self.assertFalse(tr.state.get("floor_alerted"), "released once it was clear the money was taken out")
+        floor_msgs = [t for t in tg.texts() if "자본 바닥선 도달" in t]
+        self.assertTrue(all("확인하는 중" in t for t in floor_msgs), "the floor alert says the change is being checked")
+        if floor_msgs:
+            self.assertTrue(any("신규 진입을 다시 허용" in t for t in tg.texts()))
+        eq = tr.broker.equity()["equity"]
+        self.assertIsNone(B.R.account_guard(tr.ledger, self.clock(), tr.guard_equity(eq), tr.cfg))
+
+    def test_app_transfer_whose_futures_row_is_minutes_late(self):
+        x = []
+
+        def move():
+            x.append(round(min(self.usdt() * 0.8, 10.0), 2))
+            self.fake.app_transfer(x[0], to_futures=True)
+
+        tr, tg, store, before = self.late_rows(240.0, move)
+        flows = store.read_all("flows.jsonl")
+        self.assertEqual(len(flows), 1, "one move between the wallets, not a withdrawal and then a deposit")
+        self.assertEqual((flows[0]["fut"], flows[0]["net"]), (x[0], 0.0))
+        self.assertFalse(any("출금 감지" in t or "입금 감지" in t for t in tg.texts()))
+        self.assertAlmostEqual(self.ret(tr), before["r"], delta=0.005)
+
+    def test_change_no_row_ever_explains_counts_as_a_result_later(self):
+        tr, tg, store = self.settled()
+        L0 = dict(tr.ledger)
+        self.fake.wallet += 20.0  # no row is ever written for it
+        self.tick(tr, 40)
+        self.assertAlmostEqual(tr.held(), 20.0, delta=0.5, msg="a late row is still possible")
+        self.assertAlmostEqual(tr.ledger["start_equity"], L0["start_equity"])
+        self.tick(tr, 15)
+        self.assertEqual(tr.held(), 0.0, "once no row can turn up any more, it is a result")
         self.assertEqual(store.read_all("flows.jsonl"), [])
-        self.assertEqual(tr.state["flow_hold"], 0.0, "not held for ever: after a minute it counts as a result")
-        self.run_for(tr, 1800)
-        self.assertEqual(self.nets(store), [20.0])
-        self.assertAlmostEqual(tr.ledger["start_equity"] / start0, (fv0 + 20.0) / fv0, delta=0.03)
+        self.assertAlmostEqual(tr.ledger["start_equity"], L0["start_equity"], msg="a result does not move the floor")
 
     def test_trading_result_is_not_a_flow_and_reaches_the_guards(self):
         tr, tg, store = self.settled()
@@ -623,27 +789,64 @@ class Unclear(Base):
         self.fake.income.append({"symbol": "AAAUSDT", "incomeType": "COMMISSION", "income": "-0.1", "asset": "USDT",
                                  "time": t_ms, "tranId": 2})
         self.tick(tr, 1)
-        self.assertEqual(tr.state["flow_hold"], 0.0, "explained by its rows at once")
-        # the same without rows (they lag): held for a minute, then it counts as what it is
+        self.assertEqual(tr.held(), 0.0, "explained by its rows at once")
+        self.assertAlmostEqual(tr.stats_equity(tr.state["equity"]), fv0 - 6.0, delta=fv0 * 0.02)
+        # the same without rows (they lag): the floor sees the drop at once, the figures once its rows are there
         self.fake.wallet -= 6.0
         self.tick(tr, 1)
-        self.assertAlmostEqual(tr.state["flow_hold"], -6.0, delta=0.5)
-        self.tick(tr, 3)
-        self.assertEqual(tr.state["flow_hold"], 0.0)
+        self.assertAlmostEqual(tr.held(), -6.0, delta=0.5)
+        self.assertAlmostEqual(tr.guard_equity(tr.state["equity"]), fv0 - 12.0, delta=fv0 * 0.02)
+        self.fake.income.append({"symbol": "AAAUSDT", "incomeType": "REALIZED_PNL", "income": "-6", "asset": "USDT",
+                                 "time": int(self.clock() * 1000), "tranId": 3})
+        self.tick(tr, 1)
+        self.assertEqual(tr.held(), 0.0)
         self.assertEqual(store.read_all("flows.jsonl"), [])
-        self.assertAlmostEqual(tr.guard_equity(tr.state["equity"]), fv0 - 12.0, delta=fv0 * 0.03)
-        self.assertAlmostEqual(tr.ledger["start_equity"], tr.ledger["start_equity"])
+        self.assertAlmostEqual(tr.stats_equity(tr.state["equity"]), fv0 - 12.0, delta=fv0 * 0.02)
+
+    def test_a_loss_reaches_the_equity_floor_while_the_history_cannot_be_read(self):
+        """Money safety: whatever the bot cannot explain, a drop of the futures wallet is never hidden from the
+        equity floor (the floor would otherwise stay open for a day while the account bleeds)."""
+        tr, tg, store = self.settled()
+        self.fake.income_fail = True
+        self.fake.wallet *= 0.4  # a 60 % loss, for all the bot can tell
+        self.tick(tr, 1)
+        eq = tr.broker.equity()["equity"]
+        self.assertEqual(B.R.account_guard(tr.ledger, self.clock(), tr.guard_equity(eq), tr.cfg), "EQUITY_FLOOR")
+        self.assertTrue(tr.state.get("floor_alerted"))
+        self.assertTrue(any("자본 바닥선 도달" in t and "확인하는 중" in t for t in tg.texts()))
+        # ... while a rise is not believed before it is judged
+        self.fake.wallet /= 0.4
+        self.fake.wallet += 30.0
+        self.tick(tr, 1)
+        eq = tr.broker.equity()["equity"]
+        self.assertLess(tr.guard_equity(eq), eq - 25.0)
 
     def test_unexplained_change_is_let_through_after_a_day_at_the_latest(self):
         tr, tg, store = self.settled()
         self.fake.income_fail = True
         self.fake.wallet -= 6.0  # a loss, for all the bot can tell
         self.tick(tr, 3)
-        self.assertAlmostEqual(tr.state["flow_hold"], -6.0, delta=0.5)
+        self.assertAlmostEqual(tr.held(), -6.0, delta=0.5)
         self.run_for(tr, 12 * 3600, step=300)
-        self.assertNotEqual(tr.state["flow_hold"], 0.0, "still unclear")
+        self.assertNotEqual(tr.held(), 0.0, "still unclear")
         self.run_for(tr, 13 * 3600, step=300)
-        self.assertEqual(tr.state["flow_hold"], 0.0, "not for ever")
+        self.assertEqual(tr.held(), 0.0, "not for ever")
+        self.assertEqual(store.read_all("flows.jsonl"), [])
+        self.assertTrue(any("매매 결과로 처리했습니다" in t for t in tg.texts()), "the user is told")
+        self.fake.income_fail = False
+        self.run_for(tr, 3600)
+        self.assertEqual(store.read_all("flows.jsonl"), [], "rows of that day are never booked afterwards")
+        self.assertEqual(tr.held(), 0.0)
+
+    def test_history_down_with_nothing_waiting_does_not_stop_the_split(self):
+        tr, tg, store = self.settled()
+        n = len(store.read_all("transfers.jsonl"))
+        self.fake.income_fail = True
+        tr.act_alloc(80.0)
+        self.tick(tr, 3)
+        self.assertGreater(len(store.read_all("transfers.jsonl")), n, "nothing to judge: money still moves")
+        self.fake.income_fail = False
+        self.run_for(tr, 3600)
         self.assertEqual(store.read_all("flows.jsonl"), [])
 
     def test_waits_while_a_transfer_of_the_bot_is_unconfirmed(self):
@@ -684,7 +887,7 @@ class Unclear(Base):
         self.fake.transfer_history_fail = False
         self.run_for(tr, 3600)
         self.assertEqual(store.read_all("flows.jsonl"), [])
-        self.assertEqual(tr.state["flow_hold"], 0.0)
+        self.assertEqual(tr.held(), 0.0)
         self.assertAlmostEqual(tr.ledger["start_equity"] / start0, (fv0 + amount) / fv0, delta=0.03)
 
     def test_own_transfer_judged_not_executed_that_did_go_through(self):
@@ -743,12 +946,15 @@ class Commands(Base):
 
     def test_rebase_while_the_spot_sleeve_is_not_ready(self):
         tr, tg, store = self.settled()
-        self.fake.outside_deposit(30.0)
+        base0 = tr.state["total"]["base"]
         tr.spot_ready = False  # e.g. its start-up failed and is being retried
         tr.cmd_rebase([])
+        self.assertIn("기준점을 다시 잡을 수 없습니다", tg.texts()[-1])
+        self.assertEqual(tr.state["total"]["base"], base0)
         tr.spot_ready = True
-        self.run_for(tr, 3600)
-        self.assertEqual(store.read_all("flows.jsonl"), [], "what was there at /rebase is never a deposit")
+        self.fake.outside_deposit(40.0)  # a deposit afterwards is still a deposit
+        self.run_for(tr, 1200)
+        self.assertEqual(self.nets(store), [40.0])
 
     def test_rebase_keeps_the_unit_price_going(self):
         tr, tg, store = self.settled()
@@ -817,6 +1023,14 @@ class Commands(Base):
         self.assertEqual(store.read_all("flows.jsonl"), [])
         self.assertEqual(tr.state["total"]["base"], T0["base"])
 
+    def test_futures_record_bigger_than_the_futures_wallet_is_refused(self):
+        tr, tg, store = self.settled()
+        fv = tr.state["equity"]
+        say(tr, f"/deposit {fv + 5:.0f} 선물")
+        self.assertIn("선물 지갑", tg.texts()[-1])
+        self.assertIn("크거나 같습니다", tg.texts()[-1])
+        self.assertEqual(store.read_all("flows.jsonl"), [])
+
     def test_undo_of_a_futures_side_flow_restores_the_guard_baselines(self):
         tr, tg, store = self.settled()
         L0 = dict(tr.ledger)
@@ -833,7 +1047,9 @@ class Commands(Base):
         self.fake.outside_futures(300.0)
         self.run_for(tr, 3600)
         self.assertEqual(store.read_all("flows.jsonl"), [])
-        self.assertEqual(tr.state.get("flow_hold"), 0.0)
+        self.assertEqual(tr.held(), 0.0)
+        self.assertIsNone(tr.spot.state.get("snap"), "paper mode does not watch any wallet")
+        self.assertEqual(tr.unbooked(), 0.0)
         r0, tot0 = self.ret(tr), tr.total_equity()[0]
         say(tr, "/deposit 40")
         self.assertIn("모의 모드", tg.texts()[-1])

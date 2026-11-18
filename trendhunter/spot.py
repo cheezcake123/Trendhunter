@@ -371,6 +371,20 @@ class SpotManager:
         if transit > 0 and now - float(E.get("transit_ts") or 0.0) > TRANSIT_MAX_S:
             transit = 0.0
         with_earn = self.earn_touched() or EARN_KEY in old_q
+        mr = E.get("maybe_redeem")
+        if mr and old and EARN_KEY in old_q:
+            # a redemption whose answer was lost: once Earn has been read after it, the parked amount says whether
+            # it went through. If it did, the USDT is on its way to the wallet like any other redemption.
+            drop = float(old_q[EARN_KEY]) - float(earn)
+            if drop > 0.5:
+                if transit <= 0.005:
+                    E["transit_ts"] = now
+                transit += min(drop, float(mr["amount"]) + 0.01)
+                E["maybe_redeem"] = None
+            elif float(E.get("read_ts") or 0.0) >= float(mr["ts"]) or now - float(mr["ts"]) > TRANSIT_MAX_S:
+                E["maybe_redeem"] = None  # read again and nothing left Earn: it did not go through
+        elif mr and not old:
+            E["maybe_redeem"] = None
         if old:
             du = q[USDT] - float(old_q.get(USDT) or 0.0) - float(own.get(USDT) or 0.0)
             take = min(du, transit) if du > 0 and transit > 0 else 0.0  # a redemption has landed
@@ -471,6 +485,7 @@ class SpotManager:
         try:
             pos = self.ex.earn_position()
             E["held"], E["rewards"] = round(pos["amount"], 8), pos["rewards"]
+            E["read_ts"] = now
             if pos.get("apr") is not None:
                 E["apr"] = pos["apr"]
             if pos.get("product"):
@@ -517,9 +532,15 @@ class SpotManager:
             raise RuntimeError("USDT 유연 예치 상품을 찾지 못했습니다")
         whole = amount >= held - 0.01
         self._earn_pace()
-        ref = self.ex.earn_redeem(pid, amount=None if whole else amount, redeem_all=whole)
-        amount = held if whole else amount
         E = self.state["earn"]
+        try:
+            ref = self.ex.earn_redeem(pid, amount=None if whole else amount, redeem_all=whole)
+        except (BinanceError, NetworkError) as e:
+            if self.watching() and not (isinstance(e, BinanceError) and (e.status or 0) < 500):
+                # it may have gone through: if the parked amount turns out lower, that USDT is on its way (_scan)
+                E["maybe_redeem"] = {"amount": held if whole else amount, "ts": now}
+            raise
+        amount = held if whole else amount
         E["held"] = max(held - amount, 0.0)
         if self.watching():  # still the sleeve's money until it shows up in the wallet (see _scan)
             if float(E.get("transit") or 0.0) <= 0.005:
@@ -698,6 +719,7 @@ class SpotManager:
                     # it may have been filled all the same: USDT and coins then change with no order on the books.
                     # The two sides cancel but for fee and slippage, which must not look like a withdrawal.
                     self.state["flow_unsure"] = float(self.state.get("flow_unsure") or 0.0) + abs(d)
+                    self.cache = None  # look at the wallet at the next step, at about the price it was filled at
                 continue
             if r["qty"] <= 0:
                 continue

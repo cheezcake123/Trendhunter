@@ -72,10 +72,10 @@ PRESET_NOTE = {  # v2.4 rules on Binance candles 2020-01 ~ 2026-11, funding assu
 FLOW_TYPES = ("TRANSFER", "INTERNAL_TRANSFER", "COIN_SWAP_DEPOSIT", "COIN_SWAP_WITHDRAW",
               "CROSS_COLLATERAL_TRANSFER", "STRATEGY_UMFUTURES_TRANSFER")  # income rows that move money: not results
 FLOW_EVERY_S = 600            # regular look at both wallets
-FLOW_WAIT_S = 60              # an unexplained jump of the futures wallet waits this long for its income rows
-FLOW_GIVE_UP_S = 86400        # ... and while the history is unreadable, a day at the very most
+FLOW_BACK_MS = 900_000        # income rows are read again this far back (a row can show up late); seen ones are skipped
+FLOW_RELEASE_S = FLOW_BACK_MS / 1000 + 60  # a change no row explains counts as a result once its row cannot turn up
+FLOW_GIVE_UP_S = 86400        # while the history cannot be read at all: a day at the very most
 FLOW_SPAN_MS = 2 * 3_600_000  # how far a transfer of the bot and its income row may lie apart
-FLOW_BACK_MS = 300_000        # income rows are read again this far back (a row can show up late); seen ones are skipped
 LEDGER_BASES = ("start_equity", "peak_equity", "day_start_equity")
 
 WHATS_NEW = {
@@ -270,6 +270,12 @@ class Trader:
             return list(self.cfg["symbols"])
         return [s for s in self.cfg["symbols"] if s in self.filters and self.plain_perp(s)]
 
+    def data_symbols(self):
+        """Symbols whose candles are fetched: the traded ones, plus any symbol the bot still holds a position in
+        (it is managed to the end: trailing stop, time and reverse exits). No new entries or add-ons there."""
+        held = [s for s in self.positions if s in self.cfg["symbols"] and s in self.filters and not self.plain_perp(s)]
+        return self.symbols() + sorted(held)
+
     def plain_perp(self, sym):
         """Only ordinary crypto perpetuals are traded. Binance's stock / commodity perpetuals (TradFi) have
         trading hours of their own and halts during which a position cannot be managed; delivery contracts expire."""
@@ -345,6 +351,10 @@ class Trader:
         self.send("\n".join(lines), keyboard=KEYBOARD)
         ver, seen = str(self.cfg["version"]), self.state.get("seen_version")
         if seen != ver:
+            if ver_key(seen or "0") < ver_key("2.5.0"):
+                # first start of v2.5 (also after a rollback to an older version and back): what is in the wallets
+                # now is the starting point of the watch for outside money
+                self.flow_reset()
             if seen or self.ran_before:  # an update, not a new install: every note the user has not seen yet
                 for v in sorted(WHATS_NEW, key=ver_key):
                     if ver_key(seen or "0") < ver_key(v) <= ver_key(ver):
@@ -362,8 +372,11 @@ class Trader:
             self.alert("bad_symbols", f"⚠️ 거래 불가 종목 제외: {', '.join(bad)}", every=86400)
         other = [s for s in self.cfg["symbols"] if s in self.filters and not self.plain_perp(s)]
         if other:
+            held = [s for s in other if s in self.positions]
             self.alert("tradfi_symbols", f"⚠️ {', '.join(other)}: 주식·원자재 기반(TradFi) 무기한과 만기 선물은 거래 시간이 따로 있고 "
-                       "쉬는 동안 포지션을 관리할 수 없어 지원하지 않습니다. 감시 대상에서 제외했습니다.", every=86400)
+                       "쉬는 동안 포지션을 관리할 수 없어 지원하지 않습니다. 새 진입 대상에서 제외했습니다."
+                       + (f"\n이미 열린 포지션({', '.join(short(s) for s in held)})은 손절을 유지한 채 끝까지 관리합니다."
+                          if held else ""), every=86400)
 
     def check_account_settings(self, fix=False):
         problems = []
@@ -392,7 +405,10 @@ class Trader:
         now_ms = int(now * 1000)
         tf_sec = TF_SECONDS[self.cfg["signal_tf"]]
         last_close_ms = int(now // tf_sec) * tf_sec * 1000 - 1  # close time of the candle that closed last
-        for sym in self.symbols():
+        wanted = self.data_symbols()
+        for s in [s for s in self.data if s not in wanted]:
+            self.data.pop(s, None)  # no longer watched: its last signal must not be traded
+        for sym in wanted:
             if only is not None and sym not in only:
                 continue
             try:
@@ -481,16 +497,26 @@ class Trader:
             self.on_candle(now, allow_entries=True, only=set(stale))
             r["judged"] |= self.fresh_symbols() & set(stale)
 
+    def stats_equity(self, equity):
+        """Futures equity as the performance figures know it: without a wallet change that is still being judged
+        (flow_pass). Peaks, drawdown and the day's starting balance use this view."""
+        return float(equity) - self.fut_gap()
+
     def guard_equity(self, equity):
-        """Futures equity as the guard baselines know it: without a wallet change that is still being judged
-        (flow_pass). Position sizing uses the real balance; only the baselines' view is held back."""
-        return float(equity) - float(self.state.get("flow_hold") or 0.0)
+        """Futures equity for the equity floor: the lower of the real balance and the judged one. A drop that may be
+        a withdrawal or a loss reaches the floor at once; a rise is only believed once it is judged."""
+        return float(equity) - max(self.fut_gap(), 0.0)
+
+    def note_equity(self, eq):
+        self.state["equity"], self.state["available"] = eq["equity"], eq["available"]
+        if eq.get("wallet") is not None:
+            self.state["wallet"] = float(eq["wallet"])
 
     def track_equity(self, now, eq=None):
         eq = eq or self.broker.equity()
-        self.state["equity"] = eq["equity"]
-        self.state["available"] = eq["available"]
-        e = self.guard_equity(eq["equity"])
+        self.note_equity(eq)
+        e = self.stats_equity(eq["equity"])
+        g = self.guard_equity(eq["equity"])
         L = self.ledger
         if L is None:
             self.state["ledger"] = L = R.new_ledger(e, now)
@@ -505,12 +531,15 @@ class Trader:
             dd = (e - L["peak_equity"]) / L["peak_equity"] * 100.0
             self.state["max_dd"] = min(float(self.state.get("max_dd") or 0.0), dd)
         floor = float(L.get("start_equity", 0)) * float(self.cfg["equity_floor_pct"]) / 100.0
-        if e < floor and not self.state.get("floor_alerted") and not self.state.get("pending_transfer"):
+        if g < floor and not self.state.get("floor_alerted") and not self.state.get("pending_transfer"):
             self.state["floor_alerted"] = True
-            self.send(f"🛑 자본 바닥선 도달 — 잔고 {usd(e, False)} < 바닥선 {usd(floor, False)}\n"
-                      "신규 진입을 멈췄습니다. 보유 포지션은 손절이 걸린 채 유지됩니다.\n"
-                      "전략을 점검한 뒤 /rebase (현재 잔고를 새 기준으로) 로 해제하세요.")
-            self.event("GUARD", code="EQUITY_FLOOR", equity=e)
+            gap = self.fut_gap()
+            how = ("전략을 점검한 뒤 /rebase (현재 잔고를 새 기준으로) 로 해제하세요." if gap > -1.0 else
+                   f"선물 지갑의 {usd(gap)} 변화를 아직 확인하는 중입니다. 출금이었다면 확인되는 대로 기준이 조정되고 "
+                   "신규 진입도 다시 열립니다.")
+            self.send(f"🛑 자본 바닥선 도달 — 잔고 {usd(g, False)} < 바닥선 {usd(floor, False)}\n"
+                      f"신규 진입을 멈췄습니다. 보유 포지션은 손절이 걸린 채 유지됩니다.\n{how}")
+            self.event("GUARD", code="EQUITY_FLOOR", equity=g)
         return eq
 
     # ------------------------------------------------------------ spot sleeve & allocation
@@ -613,7 +642,7 @@ class Trader:
         if self.state["mode"] != "live":
             self.broker.adjust_balance(amount if to_futures else -amount)
             self.spot.ex.adjust_usdt(-amount if to_futures else amount)
-            self._book_transfer(amount, to_futures, fut_before, why)
+            self._book_transfer(amount, to_futures, fut_before, why, wallet_before=before.get("wallet"))
             return amount
         t0 = self.server_ms()
         try:
@@ -640,13 +669,16 @@ class Trader:
             if not ok:
                 self.event("ERROR", where="transfer", msg=f"not executed: {e}"[:300])
                 return 0.0
-        self._book_transfer(amount, to_futures, fut_before, why, t0)
+        self._book_transfer(amount, to_futures, fut_before, why, t0, wallet_before=before.get("wallet"))
         return amount
 
     def server_ms(self):
-        """Binance server time (transfer history is filtered and stamped in it, not in our clock)."""
-        api = self.spot_api_or_new()
-        return int(self.now_ms() + float(getattr(api, "time_offset_ms", 0.0) or 0.0))
+        """Binance server time (transfer and income history are filtered and stamped in it, not in our clock). The
+        futures client is synced at start-up and on every timestamp error; spot and futures share one clock."""
+        off = getattr(self.api, "time_offset_ms", None)
+        if off is None:
+            off = getattr(self.spot_api_or_new(), "time_offset_ms", 0.0)
+        return int(self.now_ms() + float(off or 0.0))
 
     def wallet_moved(self, wallet_before, amount, to_futures):
         """True if the futures wallet balance changed by about the transfer amount, in the right direction."""
@@ -697,7 +729,7 @@ class Trader:
         self.state["pending_transfer"] = None
         if ok:
             self._book_transfer(p["amount"], p["to_futures"], p["fut_before"], p.get("why", "배분 조정"), p.get("t0"),
-                                late=True)
+                                late=True, wallet_before=p.get("wallet_before"))
             self.send(f"✅ 확인 중이던 이체가 처리됐습니다: {'현물→선물' if p['to_futures'] else '선물→현물'} "
                       f"{usd(p['amount'], False)}")
         else:
@@ -730,21 +762,28 @@ class Trader:
             self.state["floor_alerted"] = False  # the alert came from an unscaled baseline
         return k
 
-    def _book_transfer(self, amount, to_futures, fut_before, why, t0=None, late=False):
-        """late: confirmed some time after it was sent; fut_before is then the balance from before it was sent."""
+    def _book_transfer(self, amount, to_futures, fut_before, why, t0=None, late=False, wallet_before=None):
+        """fut_before / wallet_before: the futures balance read just before the transfer was sent. late: it was
+        confirmed some time after that (the balances read since then already contain it)."""
         signed = amount if to_futures else -amount
-        fb = fut_before if late else self.guard_equity(fut_before)
+        F = self.state.setdefault("flow_fut", {})
+        if self.flow_on() and F.get("seen") is not None:  # the guard baselines know the judged balance only
+            fb = fut_before - ((float(wallet_before) - float(F["seen"])) if wallet_before is not None else self.fut_gap())
+        else:
+            fb = fut_before
         self._scale_ledger(fb, fb + signed)
         st = self.state["spot"]
         st["net_in"] = float(st.get("net_in") or 0.0) - signed
-        F = self.state.setdefault("flow_fut", {})
         if self.state["mode"] == "live" and F.get("seen") is not None:
             # the bot's own move: neither wallet may report it as outside money (flow_pass)
             F["seen"] = float(F["seen"]) + signed
             F.setdefault("own", []).append({"ms": int(t0 or self.server_ms()), "amt": signed})
         if self.spot is not None:
             self.spot.expect({"USDT": -signed})
-        self.state["equity"] = fut_before + signed
+        if not late:
+            self.state["equity"] = fut_before + signed
+            if wallet_before is not None:
+                self.state["wallet"] = float(wallet_before) + signed
         rec = {"ts": self.now(), "mode": self.state["mode"], "to": "futures" if to_futures else "spot",
                "amount": amount, "why": why}
         self.store.append("transfers.jsonl", rec)
@@ -759,9 +798,9 @@ class Trader:
         return bool(self.cfg.get("spot_enabled", True)) and self.spot_ready and self.spot is not None
 
     def unbooked(self):
-        """Money in the wallets that the performance baselines do not know yet: seen, not booked (flow_pass)."""
+        """Money in the wallets that the performance baselines do not know yet: seen, not judged (flow_pass)."""
         acc = float(self.spot.state.get("flow_acc") or 0.0) if self.total_tracked() else 0.0
-        return float(self.state.get("flow_hold") or 0.0) + acc
+        return self.fut_gap() + acc
 
     def flow_watch(self, now, eq=None, force=False):
         """flow_pass, but trouble in it never stops trading: it is reported and the look is repeated."""
@@ -780,72 +819,88 @@ class Trader:
         """Look for money that came in or went out from outside (a deposit, a withdrawal, a transfer made by hand
         in the app) and take it out of every performance baseline. Live mode only; called at every step.
 
-        Futures wallet: its balance is compared with the last look. A change that is too big to be fees or
-        funding is kept out of the guards' sight (state["flow_hold"]) until Binance's income history says what
-        it was: a transfer row is outside money, anything else a trading result.
+        Futures wallet: F["seen"] is the balance the books have judged. A change since then is matched against
+        Binance's income history: a transfer row that is not one of the bot's own transfers is outside money,
+        every other row a trading result. Until the rows explain a change, the performance figures do not see it
+        (fut_gap), while the equity floor sees the lower of the two balances (guard_equity). A change no row ever
+        explains is counted as a result once a late row could no longer turn up (FLOW_RELEASE_S).
         Spot wallet: spot._scan adds up the quantity changes the bot's own orders and transfers do not explain.
         Both wallets are booked together and only with the whole picture, so money the user moved between them
-        nets to zero. Returns 'off', 'idle' (nothing to look at), 'none', 'booked', 'wait' or 'blocked'."""
+        nets to zero. Returns 'off', 'idle', 'none', 'booked', 'wait' (rows pending), 'unread' (the history could not
+        be read but nothing was waiting to be judged) or 'blocked'."""
         F = self.state.setdefault("flow_fut", {})
         if not self.flow_on():
-            self.state["flow_hold"] = 0.0
             return "off"
         if eq is None:
             eq = self.broker.equity()
-        self.state["equity"], self.state["available"] = eq["equity"], eq["available"]
+        self.note_equity(eq)
         w = float(eq["wallet"])
         if F.get("seen") is None or not F.get("ts"):  # first look: watch from now on
             F.update(ts=self.server_ms(), own=[], ids=[], seen=w, since=None, checked=now, blocked=None)
-            self.state["flow_hold"] = 0.0
             return "idle"
         gap = w - float(F["seen"])
-        big = abs(gap) >= max(1.0, abs(float(eq["equity"])) * 0.002)
+        big = abs(gap) >= self._flow_big(eq)
         spot_on = bool(self.cfg.get("spot_enabled", True))
         sp = self.spot if spot_on and self.spot_ready and self.spot_mode_ok() else None
+        if big and not F.get("since"):
+            F["since"] = now
         if F.get("blocked") and not force and now < float(F.get("retry") or 0.0):
-            return self._flow_unsettled(F, now, w, gap, big, "blocked", sp, tried=False)  # between two tries
+            return "blocked"  # between two tries
         stale = sp is not None and (not sp.cache or now - sp.cache_ts >= FLOW_EVERY_S - 1)
         spot_saw = sp is not None and abs(float(sp.state.get("flow_acc") or 0.0)) >= 0.005
         if not (force or big or stale or spot_saw or F.get("since") or F.get("blocked")
                 or now - float(F.get("checked") or 0.0) >= FLOW_EVERY_S):
-            F["seen"] = w  # fees, funding, small results: the books simply follow the wallet
-            self.state["flow_hold"] = 0.0
-            return "idle"
+            return "idle"  # fees, funding, small results: judged at the regular look
         # 1. nothing is judged while a transfer of the bot is unconfirmed or the self-test is moving money
-        if self.state.get("pending_transfer") or getattr(self, "spot_busy", False):
-            return self._flow_unsettled(F, now, w, gap, big, "blocked", sp)
-        # 2. the futures wallet: what do the income rows say?
-        inc = self.futures_income(F)
-        if inc is None:
-            return self._flow_unsettled(F, now, w, gap, big, "blocked", sp)
-        ext, other, own, ids, mark = inc
-        if abs(ext) < 0.005 and big and now - float(F.get("since") or now) < FLOW_WAIT_S \
-                and abs(gap - other) > max(1.0, abs(gap) * 0.25):
-            # the wallet jumped and no row explains it yet (rows can lag): look again at the next step
-            return self._flow_unsettled(F, now, w, gap, big, "wait", sp)
-        # 3. the spot wallet
-        acc = 0.0
-        if spot_on and sp is None:
-            if abs(ext) >= 0.005:  # the other wallet cannot be looked at right now: judge both later
-                return self._flow_unsettled(F, now, w, gap, big, "blocked", sp)
-        elif sp is not None:
-            if force or stale or abs(ext) >= 0.005:
+        if self.state.get("pending_transfer"):
+            return self._flow_blocked(F, now, sp, "확인 중인 봇 이체가 끝나지 않음")
+        if getattr(self, "spot_busy", False):
+            return self._flow_blocked(F, now, sp, "실주문 테스트 중")
+        # 2. the spot wallet
+        spot_err = None
+        if sp is not None:
+            if force or stale or big or F.get("since"):
                 try:
                     sp.value(refresh=True)
                 except (BinanceError, NetworkError) as e:
                     self.log.warning("flow pass: spot balances: %s", e)
-                    return self._flow_unsettled(F, now, w, gap, big, "blocked", sp)
+                    spot_err = "현물 잔고 조회 실패"
             if sp.state.get("flow_defer"):  # Earn could not be read while the wallet's USDT moved
-                return self._flow_unsettled(F, now, w, gap, big, "blocked", sp)
-            acc = float(sp.state.get("flow_acc") or 0.0)
-        # 4. the whole picture is there: the books follow the wallets from here on
-        F.update(ts=mark, own=own, ids=ids, seen=w, since=None, checked=now, blocked=None)
-        self.state["flow_hold"] = 0.0
+                spot_err = spot_err or "이자 예치 잔고 조회 실패"
+        acc = float(sp.state.get("flow_acc") or 0.0) if sp is not None else 0.0
+        floor = self._flow_floor()
+        # 3. the futures wallet: what do the income rows say?
+        inc = self.futures_income(F)
+        if inc is None:
+            start = F.get("since") or (F.get("blocked") if abs(acc) >= floor else None)
+            if start and now - float(start) >= FLOW_GIVE_UP_S:
+                self._flow_give_up(F, now, w, gap)
+                ext = 0.0
+            elif not F.get("since") and abs(acc) < floor and not spot_err:
+                F["checked"] = now
+                return "unread"  # nothing was waiting to be judged; the rows are read at the next look
+            else:
+                return self._flow_blocked(F, now, sp, "바이낸스 선물 기록 조회 실패")
+        else:
+            ext, other, own, ids, mark = inc
+            resid = gap - ext - other
+            if abs(resid) >= self._flow_big(eq):  # the rows do not (yet) explain the change
+                F["since"] = F.get("since") or now
+                if now - float(F["since"]) < FLOW_RELEASE_S:
+                    return "wait"  # rows can show up late: the same rows are read again at the next step
+                self.event("FLOW", msg=f"futures wallet change {resid:+.2f} without income rows: counted as a result")
+            if abs(ext) >= 0.005 and (spot_err or (spot_on and sp is None)):
+                # outside money on the futures side; the other wallet has to be seen too (the rows are read again)
+                return self._flow_blocked(F, now, sp, spot_err or "현물 모듈 준비 중")
+            F.update(ts=mark, own=own, ids=ids, seen=w, since=None, checked=now, blocked=None)
+        if spot_err:  # the futures side is judged; the spot wallet waits for the next try
+            return self._flow_blocked(F, now, sp, spot_err)
+        # 4. the whole picture is there
+        F["blocked"] = None
         unsure = 0.0
         if sp is not None:
             unsure = float(sp.state.get("flow_unsure") or 0.0)
             sp.state["flow_acc"], sp.state["flow_unsure"] = 0.0, 0.0
-        floor = max(1.0, self.total_equity()[0] * 0.001)  # below this it is interest, dust or rounding
         spot_flow = acc if abs(acc) >= max(floor, unsure * 0.003) else 0.0
         fut_flow = ext if abs(ext) >= floor else 0.0
         if not spot_flow and not fut_flow:
@@ -853,28 +908,49 @@ class Trader:
         self.book_flow(now, spot_flow, fut_flow)
         return "booked"
 
-    def _flow_unsettled(self, F, now, w, gap, big, status, sp=None, tried=True):
-        """This look could not be finished. A big unexplained change of the futures wallet stays out of the
-        guards' sight until it can be told what it was (the daily loss limit does not depend on this: it counts
-        closed trades). After a day without an answer it is let through as a result."""
-        if big or F.get("since"):
-            F["since"] = F.get("since") or now
-            if now - float(F["since"]) >= FLOW_GIVE_UP_S:
-                self.event("FLOW", msg=f"unexplained futures wallet change {gap:+.2f} let through after a day")
-                F["seen"], F["since"] = w, None
-        else:
-            F["seen"] = w
-        self.state["flow_hold"] = gap if F.get("since") else 0.0
-        if status == "blocked" and tried:
-            F["blocked"] = F.get("blocked") or now
-            F["retry"] = now + 60
-            acc = float(sp.state.get("flow_acc") or 0.0) if sp is not None else 0.0
-            if now - float(F["blocked"]) >= 600 and (F.get("since") or abs(acc) >= 1.0):
-                why = ("확인 중인 봇 이체가 끝나지 않음" if self.state.get("pending_transfer")
-                       else "바이낸스 기록 조회 실패")
-                self.alert("flow_blocked", f"⚠️ 입금·출금 확인이 {int((now - F['blocked']) / 60)}분째 밀려 있습니다({why}). "
-                           "확인되면 자동으로 반영합니다. 매매와 손절 관리는 그대로 진행합니다.", every=6 * 3600)
-        return status
+    def _flow_big(self, eq):
+        """A change of the futures wallet that is too big to be fees or funding."""
+        return max(1.0, abs(float(eq["equity"])) * 0.002)
+
+    def _flow_floor(self):
+        """Below this a flow is interest, dust or rounding and not booked."""
+        return max(1.0, self.total_equity()[0] * 0.001)
+
+    def _flow_blocked(self, F, now, sp, why):
+        """This look could not be finished: nothing is booked and the figures keep their pre-change view. Tried
+        again in a minute; after ten minutes with something waiting, the user is told."""
+        F["blocked"] = F.get("blocked") or now
+        F["retry"] = now + 60
+        acc = float(sp.state.get("flow_acc") or 0.0) if sp is not None else 0.0
+        if now - float(F["blocked"]) >= 600 and (F.get("since") or abs(acc) >= 1.0):
+            self.alert("flow_blocked", f"⚠️ 입금·출금 확인이 {int((now - F['blocked']) / 60)}분째 밀려 있습니다({why}). "
+                       "확인되면 자동으로 반영합니다. 그동안 현물↔선물 자동 이체는 쉬고, 매매·손절 관리·자본 바닥선은 "
+                       "그대로 작동합니다.", every=6 * 3600)
+        return "blocked"
+
+    def _flow_give_up(self, F, now, w, gap):
+        """The income history stayed unreadable for a day: what the futures wallet did meanwhile counts as results
+        from here on. The bookmark moves to now, so rows of that time can never be booked twice later."""
+        F.update(ts=self.server_ms(), own=[], ids=[], seen=w, since=None, checked=now, blocked=None)
+        self.event("FLOW", msg=f"income history unreadable for a day: futures change {gap:+.2f} counted as results")
+        if abs(gap) >= 1.0:
+            self.send(f"⚠️ 하루 동안 바이낸스 선물 손익 기록을 읽지 못해, 그동안 설명하지 못한 선물 지갑 변화 {usd(gap)}를 "
+                      "매매 결과로 처리했습니다.\n그사이 선물 지갑에 직접 넣거나 뺀 돈이 있었다면 "
+                      "/deposit 금액 선물 (또는 /withdraw 금액 선물) 로 적어 주세요.")
+
+    def fut_gap(self):
+        """What the futures wallet did since the balance the books judged last (flow_pass)."""
+        if not self.flow_on():
+            return 0.0
+        F = self.state.get("flow_fut") or {}
+        w = self.state.get("wallet")
+        if F.get("seen") is None or w is None:
+            return 0.0
+        return float(w) - float(F["seen"])
+
+    def held(self):
+        """A change of the futures wallet that is waiting to be judged (0 when there is none)."""
+        return self.fut_gap() if (self.state.get("flow_fut") or {}).get("since") else 0.0
 
     def futures_income(self, F):
         """Income rows of the futures wallet since the last look: (outside transfers, other USDT income, the bot's
@@ -943,7 +1019,8 @@ class Trader:
     def book_flow(self, now, spot_flow, fut_flow, source="auto"):
         """Outside money reached (+) or left (-) the wallets: take it out of every performance baseline, so
         return and drawdown keep measuring the trading. The wallets' current values must already include it."""
-        tot, sv, fv = self.total_equity()
+        raw, sv, fv = self.total_equity()
+        tot, fv = raw - self.unbooked(), self.stats_equity(fv)  # the judged view (all of it, right after a look)
         net = spot_flow + fut_flow
         if spot_flow and fut_flow and abs(net) < max(1.0, tot * 0.001):
             net = 0.0  # the same money changed wallets: a few cents of difference are not a deposit
@@ -970,6 +1047,7 @@ class Trader:
             self.state["force_alloc"] = True  # split the new money (or the gap) at the next daily check
         if spot_flow:
             st["net_in"] = float(st.get("net_in") or 0.0) + spot_flow
+        floor_was = bool(self.state.get("floor_alerted"))
         kf = self._scale_ledger(fv - fut_flow, fv) if fut_flow else 1.0
         rec = {"ts": now, "mode": self.state["mode"], "spot": round(spot_flow, 2), "fut": round(fut_flow, 2),
                "net": round(net, 2) + 0.0, "total": round(tot, 2), "src": source}
@@ -977,13 +1055,16 @@ class Trader:
         self.state["last_flow"] = dict(rec, k=k, kf=kf, prev=prev)
         self.event("FLOW", msg=f"{net:+.2f} (현물 {spot_flow:+.2f}, 선물 {fut_flow:+.2f}, {source})")
         self.save()
-        self.send(self.flow_text(rec))
+        text = self.flow_text(rec)
+        if floor_was and not self.state.get("floor_alerted"):
+            text += "\n자본 바닥선 경고는 손실이 아니라 옮긴 돈 때문이었습니다. 기준을 조정했고 신규 진입을 다시 허용합니다."
+        self.send(text)
         return rec
 
     def flow_text(self, rec):
         net, sp, fu = rec["net"], rec["spot"], rec["fut"]
-        if abs(net) < 0.005:  # the user moved money between the two wallets in the app
-            return (f"↔️ 앱에서 직접 옮긴 이체를 반영했습니다: 현물 {usd(sp)}, 선물 {usd(fu)}.\n"
+        if abs(net) < 0.005:  # the same money changed wallets (moved by hand in the app, or a late transfer)
+            return (f"↔️ 현물↔선물 지갑 사이를 오간 돈을 반영했습니다: 현물 {usd(sp)}, 선물 {usd(fu)}.\n"
                     "총자산은 그대로라 수익률 계산은 바뀌지 않습니다. 배분은 다음 09:05 KST 점검 때 다시 봅니다.")
         kind = "입금" if net > 0 else "출금"
         where = " · ".join(x for x in (f"현물 {usd(sp)}" if sp else "", f"선물 {usd(fu)}" if fu else "") if x)
@@ -994,6 +1075,13 @@ class Trader:
             lines.append(f"{kind}이 아니라면 /flows undo 로 취소할 수 있습니다.")
         return "\n".join(lines)
 
+    def flow_waiting(self):
+        """Money seen in the wallets and still waiting to be judged (a held futures change, unbooked spot changes)."""
+        if not self.flow_on():
+            return 0.0
+        acc = float(self.state.get("spot", {}).get("flow_acc") or 0.0) if self.total_tracked() else 0.0
+        return self.held() + acc
+
     def flow_reset(self):
         """Watch for outside money from this moment on: whatever is in the wallets now is not a flow."""
         st = self.state.setdefault("spot", {})
@@ -1001,7 +1089,7 @@ class Trader:
         if self.spot is not None:
             self.spot.cache = None
         self.state["flow_fut"] = {}
-        self.state["flow_hold"] = 0.0
+        self.state.pop("flow_hold", None)  # written by an earlier build of v2.5
         self.state["last_flow"] = None
 
     def daily_spot(self, now):
@@ -1011,7 +1099,7 @@ class Trader:
             return  # wait until the last transfer is confirmed before moving more money
         flow = self.flow_watch(now, force=True)  # the job starts from wallets whose outside money is booked
         if flow == "wait":
-            return  # a minute at most; the job is still due at the next step
+            return  # income rows are still due (minutes at most); the job is still due at the next step
         self.spot.load_filters()  # cheap; also drops a delisted candidate
         if not self.spot.tradable():
             raise RuntimeError("거래 가능한 현물 종목이 없습니다(바이낸스 점검 중일 수 있음)")
@@ -1304,7 +1392,8 @@ class Trader:
             return
         for sym, pos in list(self.positions.items()):
             d = self.data.get(sym)
-            if not d or not d.get("fresh") or (only is not None and sym not in only):
+            if not d or not d.get("fresh") or (only is not None and sym not in only) \
+                    or (self.filters and not self.plain_perp(sym)):
                 continue
             if pos.get("exit_reason") or pos.get("fin_tries"):
                 continue  # already closed or closing, only waiting to be booked: never add to that
@@ -1398,7 +1487,7 @@ class Trader:
     def try_entries(self, now, only=None):
         cands = [(sym, d["sig"]) for sym, d in self.data.items()
                  if d.get("fresh") and d["sig"].get("side") and sym not in self.positions
-                 and (only is None or sym in only)]
+                 and (only is None or sym in only) and (not self.filters or self.plain_perp(sym))]
         cands.sort(key=lambda x: -x[1].get("strength", 0))
         for sym, sig in cands:
             eq = self.broker.equity()
@@ -1529,8 +1618,9 @@ class Trader:
         self.event("EXIT", sym=sym, side=pos["side"], pnl=round(pnl, 4), r=round(rmult, 2), reason=reason)
         head = "✅ 익절" if pnl > 0 else "❌ 손절" if pnl < 0 else "➖ 본전"
         try:
-            eq = self.broker.equity()["equity"]
-            self.state["equity"] = eq
+            e = self.broker.equity()
+            self.note_equity(e)
+            eq = e["equity"]
         except (BinanceError, NetworkError):
             eq = self.state.get("equity") or 0
         self.send(f"{head} — {short(sym)} {SIDE_KO[pos['side']]} ({EXIT_KO.get(reason, reason)})\n"
@@ -2022,9 +2112,7 @@ class Trader:
             return
         if not self._flow_settled_for_manual():
             return
-        if sign > 0 and amt >= self.total_equity()[0]:
-            self.send(f"입금액({usd(amt, False)})이 지금 총자산({usd(self.total_equity()[0], False)})보다 크거나 같습니다. "
-                      "이미 지갑에 들어와 있는 돈만 기록할 수 있습니다. 금액을 다시 확인해 주세요.")
+        if not self._flow_amount_ok(sign * amt, wallet):
             return
         self.confirm(f"자동으로 감지된 {word}이 없습니다. 그래도 {usd(amt, False)}을 {where} 지갑 {word}으로 기록할까요?\n"
                      "수익률 계산에만 반영하고 돈은 움직이지 않습니다. 이미 반영된 금액을 또 적으면 수익률이 틀어집니다.",
@@ -2041,9 +2129,20 @@ class Trader:
         if res == "booked":
             self.send("ℹ️ 방금 확인에서 위 내용을 자동으로 반영했습니다. 따로 더 기록하지 않았습니다.")
             return False
-        if res in ("wait", "blocked"):
+        if res in ("wait", "blocked", "unread"):
             self.send("⏳ 지금은 지갑 변화를 확인하는 중이라 직접 기록할 수 없습니다(이체 확인 중이거나 바이낸스 기록을 "
                       "읽지 못함). 확인이 끝나면 봇이 자동으로 반영합니다. 몇 분 뒤 /flows 로 확인해 주세요.")
+            return False
+        return True
+
+    def _flow_amount_ok(self, amount, wallet):
+        """A deposit can only be recorded for money that is already in that wallet."""
+        tot, sv, fv = self.total_equity()
+        have = fv if wallet == "fut" else tot
+        if amount > 0 and amount >= have:
+            where = "선물 지갑" if wallet == "fut" else "총자산"
+            self.send(f"입금액({usd(amount, False)})이 지금 {where}({usd(have, False)})보다 크거나 같습니다. "
+                      "이미 지갑에 들어와 있는 돈만 기록할 수 있습니다. 금액을 다시 확인해 주세요.")
             return False
         return True
 
@@ -2066,8 +2165,7 @@ class Trader:
             self.spot.value(refresh=True)
         elif not self._flow_settled_for_manual():  # the wallets may have changed since the question was asked
             return
-        elif amount > 0 and amount >= self.total_equity()[0]:
-            self.send("입금액이 지금 총자산보다 크거나 같아 기록하지 않았습니다.")
+        elif not self._flow_amount_ok(amount, wallet):
             return
         self.book_flow(self.now(), amount if wallet == "spot" else 0.0, amount if wallet == "fut" else 0.0, "manual")
 
@@ -2307,11 +2405,15 @@ class Trader:
         except ValueError as e:
             self.send(f"값 오류: {e}")
             return
+        waiting = self.flow_waiting() if key in ("flow_detect", "spot_enabled") else 0.0
         settings = self.store.load_settings()
         settings[key] = val
         self.store.save_settings(settings)
         self.cfg[key] = val
         note = ""
+        if abs(waiting) >= 1.0:
+            note = (f"\n확인 중이던 지갑 변화 {usd(waiting)}는 반영하지 않고 넘깁니다. 입금·출금이었다면 /deposit 또는 "
+                    "/withdraw 로 적어 주세요(그대로 두면 수익률에 섞입니다).")
         if key == "symbols":
             self.refresh_data()
         if key in ("spot_candidates", "spot_universe_size") and self.spot_ready:
@@ -2334,12 +2436,16 @@ class Trader:
         self.send(f"✅ {key} = {val} 로 바꿨습니다 (즉시 적용).{note}")
 
     def cmd_rebase(self, args):
-        # what is in the wallets now is the new base: none of it may be booked as a deposit later (also when the
-        # spot sleeve is not ready at this moment)
+        if self.cfg.get("spot_enabled", True) and not (self.spot_ready and self.spot_mode_ok()):
+            # the new base needs both wallets: without the spot balance, money that reaches the spot wallet later
+            # could be counted neither as a deposit nor in the old base
+            self.send("현물 모듈이 아직 준비되지 않아 지금은 기준점을 다시 잡을 수 없습니다(현물 잔고를 읽어야 합니다). "
+                      "몇 분 뒤 다시 시도해 주세요. 계속 안 되면 /selftest 로 점검해 주세요.")
+            return
+        # what is in the wallets now is the new base: none of it may be booked as a deposit later
         self.flow_reset()
         try:  # the balance as it is now, not as the last step saw it
-            e = self.broker.equity()
-            self.state["equity"], self.state["available"] = e["equity"], e["available"]
+            self.note_equity(self.broker.equity())
         except (BinanceError, NetworkError) as err:
             self.log.warning("rebase: futures balance: %s", err)
         eq = self.state.get("equity") or 0.0

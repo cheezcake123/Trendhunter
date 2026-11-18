@@ -224,6 +224,34 @@ class ReviewFixes(unittest.TestCase):
         self.assertIn("지원하지 않습니다", tg.texts()[-1])
         self.assertEqual(tr.cfg["symbols"], before)
 
+    def test_position_in_a_symbol_that_became_tradfi_is_still_managed(self):
+        tr, tg, store = self.make(mode="live", days=10)
+        tr.startup()
+        for _ in range(8 * 144):
+            self.clock.advance(600)
+            tr.step()
+            if tr.positions:
+                break
+        self.assertTrue(tr.positions, "a position was opened")
+        sym = next(iter(tr.positions))
+        self.fake.contract_type[sym] = "TRADIFI_PERPETUAL"
+        tr.load_filters()
+        self.assertNotIn(sym, tr.symbols())
+        self.assertIn(sym, tr.data_symbols(), "its candles are still fetched while the position is open")
+        self.assertTrue(any("끝까지 관리합니다" in t for t in tg.texts()))
+        tr.refresh_data()
+        self.assertIn(sym, tr.data)
+        n_trades = len([t for t in self.fake.trades if t["symbol"] == sym])
+        while sym in tr.positions and self.clock() < START + 40 * 86400:
+            self.clock.advance(600)
+            tr.step()
+            if sym in tr.positions:
+                self.assertEqual(len(self.fake.open_algos(sym)), 1, "exactly one exchange stop, all the way")
+        self.steps(tr, 3 * 144)
+        later = [t for t in self.fake.trades if t["symbol"] == sym][n_trades:]
+        self.assertLessEqual(len(later), 1, "only the exit: no new entries or add-ons there")
+        self.assertNotIn(sym, tr.data)
+
     def test_dust_position_can_open(self):
         plan = SS.plan_trades({"A": 4.0}, {"A": 0.06}, 100.0, 0.05, 5.25)
         self.assertEqual(plan, [("A", 5.25, False)])
