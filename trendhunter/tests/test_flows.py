@@ -452,6 +452,29 @@ class Detection(Base):
         self.assertEqual(self.nets(store), [30.0])
         self.assertAlmostEqual(self.ret(tr), r0, delta=0.01)
 
+    def test_futures_deposit_landing_during_the_daily_job_before_its_transfer(self):
+        tr, tg, store = self.settled()
+        fv0, start0, r0 = tr.state["equity"], tr.ledger["start_equity"], self.ret(tr)
+        n = len(store.read_all("transfers.jsonl"))
+        real, hit = tr.spot.ex.order, []
+
+        def order(*a, **kw):
+            if not hit:
+                hit.append(1)
+                self.fake.outside_futures(30.0)  # lands after the job's look, before it moves money to futures
+            return real(*a, **kw)
+
+        tr.spot.ex.order = order
+        tr.act_alloc(25.0)
+        self.tick(tr, 3)
+        moves = store.read_all("transfers.jsonl")[n:]
+        self.assertTrue(hit and moves and moves[0]["to"] == "futures")
+        self.assertEqual(self.nets(store), [30.0])
+        fv = tr.state["equity"]
+        self.assertAlmostEqual(tr.ledger["start_equity"] / start0, fv / fv0, delta=0.01,
+                               msg="the floor follows the money once: the transfer and the deposit, nothing twice")
+        self.assertAlmostEqual(self.ret(tr), r0, delta=0.01)
+
     def test_deposit_seconds_after_the_bots_own_moves_is_booked(self):
         tr, tg, store = self.settled()
         r0 = self.ret(tr)

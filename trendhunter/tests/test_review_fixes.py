@@ -224,6 +224,31 @@ class ReviewFixes(unittest.TestCase):
         self.assertIn("지원하지 않습니다", tg.texts()[-1])
         self.assertEqual(tr.cfg["symbols"], before)
 
+    def test_entry_filter_skips_tradfi_even_with_a_fresh_signal(self):
+        """The last line of defence: a signal on a TradFi symbol (e.g. the candle that closed its last position) is
+        never even considered for an entry."""
+        import bot as BOT
+        tr, tg, store = self.make(mode="live", days=3)
+        tr.startup()
+        self.fake.contract_type["BBBUSDT"] = "TRADIFI_PERPETUAL"
+        tr.load_filters()
+        d = dict(next(iter(tr.data.values())))
+        d["sig"] = dict(d["sig"], side="LONG", strength=99.0)
+        d["fresh"] = True
+        tr.data["BBBUSDT"] = d
+        seen, real = [], BOT.R.can_enter
+
+        def spy(L, positions, sym, *a, **kw):
+            seen.append(sym)
+            return real(L, positions, sym, *a, **kw)
+
+        BOT.R.can_enter = spy
+        try:
+            tr.try_entries(self.clock())
+        finally:
+            BOT.R.can_enter = real
+        self.assertNotIn("BBBUSDT", seen)
+
     def test_position_in_a_symbol_that_became_tradfi_is_still_managed(self):
         tr, tg, store = self.make(mode="live", days=10)
         tr.startup()
