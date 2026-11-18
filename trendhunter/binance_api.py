@@ -223,10 +223,10 @@ class BinanceFutures:
         return self._request("GET", "/fapi/v1/userTrades", {
             "symbol": symbol, "startTime": start_time, "endTime": end_time, "limit": limit}, signed=True)
 
-    def income(self, symbol=None, income_type=None, start_time=None, end_time=None, limit=1000):
+    def income(self, symbol=None, income_type=None, start_time=None, end_time=None, limit=1000, retries=None):
         return self._request("GET", "/fapi/v1/income", {
             "symbol": symbol, "incomeType": income_type, "startTime": start_time,
-            "endTime": end_time, "limit": limit}, signed=True)
+            "endTime": end_time, "limit": limit}, signed=True, retries=retries)
 
 
 def parse_filters(exinfo, symbols=None):

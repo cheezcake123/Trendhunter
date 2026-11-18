@@ -207,6 +207,23 @@ class ReviewFixes(unittest.TestCase):
         self.steps(tr, 2)
         self.assertTrue(tr.state.get("force_alloc"))
 
+    def test_stock_and_commodity_perpetuals_are_never_traded(self):
+        """Binance lists TradFi perpetuals (stocks, gold, oil) next to the crypto ones, with trading hours of their
+        own. The bot must not open positions there: during a halt it could not manage them."""
+        tr, tg, store = self.make(mode="live", days=8)
+        self.fake.contract_type["BBBUSDT"] = "TRADIFI_PERPETUAL"
+        tr.startup()
+        self.assertNotIn("BBBUSDT", tr.symbols())
+        self.assertIn("AAAUSDT", tr.symbols())
+        self.assertTrue(any("BBBUSDT" in t and "지원하지 않습니다" in t for t in tg.texts()))
+        self.steps(tr, 6 * 144)
+        self.assertTrue(self.fake.trades, "the other symbols were traded")
+        self.assertFalse([t for t in self.fake.trades if t["symbol"] == "BBBUSDT"])
+        before = list(tr.cfg["symbols"])
+        tr.handle_update({"message": {"chat": {"id": 42}, "text": "/set symbols AAA,BBB"}})
+        self.assertIn("지원하지 않습니다", tg.texts()[-1])
+        self.assertEqual(tr.cfg["symbols"], before)
+
     def test_dust_position_can_open(self):
         plan = SS.plan_trades({"A": 4.0}, {"A": 0.06}, 100.0, 0.05, 5.25)
         self.assertEqual(plan, [("A", 5.25, False)])

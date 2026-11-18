@@ -5,10 +5,11 @@ capital (other coins are ignored). Once a day, shortly after the 00:00 UTC (09:0
 the sleeve recomputes its momentum/volatility targets (spot_strategy.py) and trades with MARKET
 orders: sells first, then buys. No leverage, no stops needed — at worst it simply holds coins.
 
-Outside money: the live wallet's quantities (USDT and candidate coins) only change through the bot's own
-orders, transfers and Earn moves. A change with none of those behind it is a deposit, a withdrawal or
-something the user did in the app; value() adds it up in state["flow_acc"] and the trader books it
-(bot.flow_pass), so performance figures measure trading and not the money that was put in.
+Outside money: the live wallet's quantities (USDT, parked USDT and the candidate coins) are compared with
+the last look every time the balances are read. The bot's own confirmed orders and transfers are taken out
+first (expect()), so whatever is left is a deposit, a withdrawal or something the user did in the app. It
+is added up in state["flow_acc"] and booked by the trader (bot.flow_pass): performance figures measure the
+trading, not the money that was put in.
 
 With spot_earn on, idle USDT waits in Binance Simple Earn (flexible USDT) instead of the spot wallet:
 redeemed just before the daily trades/transfers need it, parked again afterwards (2 USDT stay in the
@@ -32,8 +33,10 @@ USDT = "USDT"
 EARN_BUFFER = 2.0     # USDT always left in the spot wallet when parking
 EARN_GAP_S = 3.5      # Binance: subscribe/redeem at most once per 3 s per account
 EARN_POLLS = 4        # balance checks while a redemption lands in the spot wallet
-OWN_GRACE_S = 120     # after the bot's own order / transfer / Earn move, balance changes are its own for this long
-EARN_KEY = "USDT:earn"  # parked USDT in the quantity snapshot
+EARN_KEY = "USDT:earn"        # parked USDT in the quantity snapshot
+TRANSIT_KEY = "USDT:transit"  # redeemed from Earn, not yet seen in the wallet
+TRANSIT_MAX_S = 86400         # after a day, redeemed USDT that never arrived is money that left
+DEFER_MAX_S = 3600            # how long a look may be put off while Earn cannot be read
 PAPER_EARN_ID = "PAPER-USDT"
 
 
@@ -272,7 +275,8 @@ class PaperSpot:
 # ---------------------------------------------------------------- manager
 
 class SpotManager:
-    def __init__(self, cfg, store, api, public_api, log, send, state, clock=time.time, sleep=time.sleep):
+    def __init__(self, cfg, store, api, public_api, log, send, state, clock=time.time, sleep=time.sleep,
+                 persist=None):
         self.cfg = cfg
         self.store = store
         self.api = api                # signed spot client (keys)
@@ -282,19 +286,17 @@ class SpotManager:
         self.state = state            # dict persisted by the trader (state["spot"])
         self.clock = clock
         self.sleep = sleep
+        self.persist = persist or (lambda: None)  # writes the trader's state to disk
         self.filters = {}
         self.ex = None
         self.cache = None
         self.cache_ts = 0.0
         for k, v in (("last_day", None), ("universe", []), ("universe_month", None), ("targets", {}),
                      ("diag", {}), ("net_in", None), ("fails", 0), ("retry_at", 0.0), ("last_trades", []),
-                     ("earn", {}), ("snap", None), ("flow_acc", 0.0)):
+                     ("earn", {}), ("snap", None), ("flow_acc", 0.0), ("own_dq", {}), ("flow_unsure", 0.0),
+                     ("flow_defer", None)):
             self.state.setdefault(k, v)
         self._earn_last = -1e9  # monotonic time of the last Earn subscribe/redeem
-        # With a stored snapshot, money that arrived while the bot was down is still noticed, unless the bot's own
-        # last move came after that snapshot (stopped mid-operation): then the first look only re-bases.
-        snap = self.state.get("snap") or {}
-        self.own_op = snap.get("seq") != int(self.state.get("op_seq") or 0)
 
     # ------------------------------------------------------------ setup
     def candidates(self):
@@ -323,18 +325,38 @@ class SpotManager:
         return self.ex
 
     # ------------------------------------------------------------ outside money
-    def mark_own(self):
-        """The bot itself is about to change (or may just have changed) the wallet: the next look at the
-        balances is a new starting point, not a deposit or withdrawal."""
-        self.own_op = True
-        self.state["op_seq"] = int(self.state.get("op_seq") or 0) + 1
-        self.state["own_until"] = self.clock() + OWN_GRACE_S
+    def watching(self):
+        return self.ex is not None and self.ex.name == "live" and bool(self.cfg.get("flow_detect", True))
+
+    def expect(self, deltas):
+        """The bot's own CONFIRMED move changed the wallet by these quantities ({asset: +/-qty}). They are taken
+        out at the next look, whether that look comes before or after this call (a transfer that could only be
+        confirmed later was already seen: the correction then cancels it)."""
         self.cache = None
+        if not self.watching() or not self.state.get("snap"):
+            return
+        own = self.state.setdefault("own_dq", {})
+        for a, d in deltas.items():
+            own[a] = float(own.get(a) or 0.0) + float(d)
+
+    def _own_fill(self, sym, side, r):
+        sign = 1.0 if side == "BUY" else -1.0
+        d = {self.filters[sym]["base"]: sign * r["qty"], USDT: -sign * r["quote"]}
+        for a, x in (r.get("fee") or {}).items():
+            d[a] = d.get(a, 0.0) - float(x or 0.0)
+        self.expect(d)
+        self.persist()  # a restart right after the fill must not see it as coins that came from outside
 
     def _scan(self, bal, prices, now, earn):
-        """Compare the wallet's quantities with the last look. See the module docstring ('Outside money').
-        Parked USDT (Earn) is part of the picture, so USDT the user moves between the wallet and Earn by hand
-        is not mistaken for a deposit or withdrawal. Returns the Earn amount (re-read when the wallet's USDT moved)."""
+        """Compare the wallet's quantities with the last look (module docstring, 'Outside money'). Wallet USDT,
+        parked USDT and USDT on its way back from Earn are one pot, so parking, redeeming and what the user
+        moves between the wallet and Earn by hand never count. Returns the Earn amount (re-read when the
+        wallet's USDT moved with nothing of the bot behind it)."""
+        E = self.state["earn"]
+        if not self.watching():
+            self.state.update(snap=None, own_dq={}, flow_defer=None)
+            E["transit"] = 0.0
+            return earn
         usdt = bal.get(USDT, {"free": 0.0, "locked": 0.0})
         q, px = {USDT: usdt["free"] + usdt["locked"]}, {}
         for s in self.known():
@@ -343,35 +365,45 @@ class SpotManager:
                 q[base] = bal[base]["free"] + bal[base]["locked"]
                 px[base] = float(prices.get(s) or 0.0)
         old = self.state.get("snap")
-        E = self.state["earn"]
-        if now - float(E.get("transit_ts") or 0.0) > 86400:
-            E["transit"] = 0.0
-        quiet = not self.own_op and now >= float(self.state.get("own_until") or 0.0)
-        watch = bool(old) and quiet and self.ex.name == "live" and self.cfg.get("flow_detect", True)
-        if self.earn_touched():
-            if watch and abs(q[USDT] - float(old["q"].get(USDT) or 0.0)) > 0.5:
-                earn = self.earn_value(refresh=True)  # the Earn balance is read hourly: look now, both sides count
+        old_q, old_px = (old or {}).get("q") or {}, (old or {}).get("px") or {}
+        own = self.state.get("own_dq") or {}
+        transit = float(E.get("transit") or 0.0)
+        if transit > 0 and now - float(E.get("transit_ts") or 0.0) > TRANSIT_MAX_S:
+            transit = 0.0
+        with_earn = self.earn_touched() or EARN_KEY in old_q
+        if old:
+            du = q[USDT] - float(old_q.get(USDT) or 0.0) - float(own.get(USDT) or 0.0)
+            take = min(du, transit) if du > 0 and transit > 0 else 0.0  # a redemption has landed
+            if with_earn and abs(du - take) > 0.5:
+                # USDT moved with nothing of ours behind it: it may have come from / gone to Earn (moved by hand,
+                # or by a request of ours whose answer was lost). Both sides must be seen in the same look.
+                if self.earn_read(now):
+                    self.state["flow_defer"] = None
+                else:
+                    since = self.state.get("flow_defer") or now
+                    self.state["flow_defer"] = since
+                    if now - since < DEFER_MAX_S:
+                        return float(E.get("held") or 0.0)  # nothing is judged: the next look compares again
+                earn = float(E.get("held") or 0.0)
+            else:
+                self.state["flow_defer"] = None
+            transit -= take
+        if with_earn:
             q[EARN_KEY] = earn
-        if watch:
+        if transit > 0 or TRANSIT_KEY in old_q:
+            q[TRANSIT_KEY] = transit
+        E["transit"] = transit
+        if old:
             flow = 0.0
-            for a in set(old["q"]) | set(q):
-                d = q.get(a, 0.0) - float(old["q"].get(a) or 0.0)
+            for a in set(old_q) | set(q):
+                d = q.get(a, 0.0) - float(old_q.get(a) or 0.0) - float(own.get(a) or 0.0)
                 if abs(d) < 1e-12:
                     continue
-                if a in (USDT, EARN_KEY):
-                    late = float(E.get("transit") or 0.0)
-                    if d > 0 and late > 0:
-                        # an Earn redemption that took its time has landed in the wallet (or never happened and
-                        # the USDT shows up in Earn again): the bot's own money, not new money
-                        take = min(d, late)
-                        d -= take
-                        E["transit"] = late - take
-                    flow += d
-                else:
-                    flow += d * float(px.get(a) or old["px"].get(a) or 0.0)
+                p = 1.0 if a in (USDT, EARN_KEY, TRANSIT_KEY) else float(px.get(a) or old_px.get(a) or 0.0)
+                flow += d * p
             self.state["flow_acc"] = float(self.state.get("flow_acc") or 0.0) + flow
-        self.state["snap"] = {"q": q, "px": px, "seq": int(self.state.get("op_seq") or 0)}
-        self.own_op = False
+        self.state["snap"] = {"q": q, "px": px}
+        self.state["own_dq"] = {}
         return earn
 
     def tradable(self):
@@ -400,9 +432,10 @@ class SpotManager:
             eq += q * p
         earn = self.earn_value()  # parked USDT is sleeve money: leaving it out would skew the spot/futures split
         earn = self._scan(bal, prices, now, earn)
-        eq += earn
+        transit = float(self.state["earn"].get("transit") or 0.0)  # redeemed, on its way to the wallet
+        eq += earn + transit
         self.cache = {"equity": eq, "usdt": usdt["free"] + usdt["locked"], "usdt_free": usdt["free"],
-                      "earn": earn, "holdings": hold, "ts": now}
+                      "earn": earn, "transit": transit, "holdings": hold, "ts": now}
         self.cache_ts = now
         if self.state.get("net_in") is None:
             self.state["net_in"] = eq  # whatever was already in the wallet counts as the starting capital
@@ -428,17 +461,24 @@ class SpotManager:
             return 0.0
         now = self.clock()
         if refresh or now - float(E.get("ts") or 0.0) >= max_age:
-            E["ts"] = now
-            try:
-                pos = self.ex.earn_position()
-                E["held"], E["rewards"] = round(pos["amount"], 8), pos["rewards"]
-                if pos.get("apr") is not None:
-                    E["apr"] = pos["apr"]
-                if pos.get("product"):
-                    E["product"] = pos["product"]
-            except (BinanceError, NetworkError, KeyError, TypeError, ValueError) as e:
-                self.log.warning("earn position: %s", e)
+            self.earn_read(now)
         return float(E.get("held") or 0.0)
+
+    def earn_read(self, now):
+        """Read the parked amount from Binance. True when it was read (False: the last known amount stands)."""
+        E = self.state["earn"]
+        E["ts"] = now
+        try:
+            pos = self.ex.earn_position()
+            E["held"], E["rewards"] = round(pos["amount"], 8), pos["rewards"]
+            if pos.get("apr") is not None:
+                E["apr"] = pos["apr"]
+            if pos.get("product"):
+                E["product"] = pos["product"]
+            return True
+        except (BinanceError, NetworkError, KeyError, TypeError, ValueError) as e:
+            self.log.warning("earn position: %s", e)
+            return False
 
     def earn_product(self, now):
         """USDT flexible product {id, min}, looked up at most once a day. Raises on API trouble."""
@@ -461,11 +501,12 @@ class SpotManager:
     def _earn_book(self, now, kind, amount, ref, why):
         self.store.append("earn.jsonl", {"ts": now, "mode": self.ex.name, "kind": kind, "asset": USDT,
                                          "amount": round(amount, 6), "id": ref, "why": why})
-        self.mark_own()
+        self.cache = None
 
     def _earn_failed(self, now, what, e):
         E = self.state["earn"]
         E["fail_day"] = utc_day(now)  # no more Earn calls today
+        E["ts"] = 0.0  # the request may have gone through all the same: read the parked amount at the next look
         E["last_error"] = f"{what}: {e}"[:200]
         self.log.warning("earn %s failed: %s", what, e)
         self.send(f"⚠️ 이자 예치 {what} 실패: {e}\n매매·이체·선물 손절 관리는 그대로 진행합니다. 내일 다시 시도합니다.")
@@ -476,10 +517,14 @@ class SpotManager:
             raise RuntimeError("USDT 유연 예치 상품을 찾지 못했습니다")
         whole = amount >= held - 0.01
         self._earn_pace()
-        self.mark_own()
         ref = self.ex.earn_redeem(pid, amount=None if whole else amount, redeem_all=whole)
         amount = held if whole else amount
-        self.state["earn"]["held"] = max(held - amount, 0.0)
+        E = self.state["earn"]
+        E["held"] = max(held - amount, 0.0)
+        if self.watching():  # still the sleeve's money until it shows up in the wallet (see _scan)
+            if float(E.get("transit") or 0.0) <= 0.005:
+                E["transit_ts"] = now  # the clock runs from the oldest redemption that is still out
+            E["transit"] = float(E.get("transit") or 0.0) + amount
         self._earn_book(now, "redeem", amount, ref, why)
         return amount
 
@@ -497,23 +542,14 @@ class SpotManager:
         except Exception as e:  # noqa: BLE001 — Earn must never stop trading or transfers
             self._earn_failed(now, "환매", e)
             return 0.0
-        self._await_redeemed(now, before, got)
-        return got
-
-    def _await_redeemed(self, now, before, got):
-        """Wait briefly for redeemed USDT to land in the spot wallet (usually instant; never hold the main loop
-        for long). What has not arrived is remembered, so that it is not mistaken for a deposit when it does."""
-        for _ in range(EARN_POLLS):
+        for _ in range(EARN_POLLS):  # usually instant; never hold the main loop for long
             try:
                 if self.value(refresh=True)["usdt_free"] >= before + got * 0.99:
-                    return True
+                    break
             except (BinanceError, NetworkError):
                 pass
             self.sleep(1.5)
-        E = self.state["earn"]
-        E["transit"] = float(E.get("transit") or 0.0) + got
-        E["transit_ts"] = now
-        return False
+        return got
 
     def earn_park(self, now):
         """After the daily trades/transfers: park spot USDT above the 2 USDT buffer (or, with spot_earn off,
@@ -526,13 +562,10 @@ class SpotManager:
                 if held <= 0.01:
                     self.state["earn"]["held"] = 0.0
                     return 0.0
-                before = self.value(refresh=True)["usdt_free"]
-                got = self._earn_redeem(now, held, held, "이자 예치 끔")
+                return -self._earn_redeem(now, held, held, "이자 예치 끔")
             except Exception as e:  # noqa: BLE001
                 self._earn_failed(now, "환매", e)
                 return 0.0
-            self._await_redeemed(now, before, got)
-            return -got
         try:
             free = self.value(refresh=True)["usdt_free"]
             amt = math.floor((free - EARN_BUFFER) * 100) / 100
@@ -544,7 +577,6 @@ class SpotManager:
             if amt < prod["min"]:
                 return 0.0
             self._earn_pace()
-            self.mark_own()
             ref = self.ex.earn_subscribe(prod["id"], amt)
         except Exception as e:  # noqa: BLE001
             self._earn_failed(now, "예치", e)
@@ -646,7 +678,6 @@ class SpotManager:
                     q = floor_step(q, f["step"])
                     if q < float(f["min_qty"]) or q * h["px"] < float(f["min_notional"]):
                         continue
-                    self.mark_own()
                     r = self.ex.order(sym, "SELL", qty=q, tag="S")
                 else:
                     cash = self.value(refresh=True)["usdt_free"] - max(reserve, 0.0)
@@ -659,15 +690,19 @@ class SpotManager:
                     est = floor_step(spend / px_, f["step"])
                     if est < float(f["min_qty"]) or est * px_ < float(f["min_notional"]) * 1.01:
                         continue  # the exchange's lot size makes this amount untradeable
-                    self.mark_own()
                     r = self.ex.order(sym, "BUY", quote=spend, tag="B")
             except (BinanceError, NetworkError) as e:
                 errors.append(f"{sym[:-4]}: {e}")
                 self.log.warning("spot order %s: %s", sym, e)
+                if not (isinstance(e, BinanceError) and (e.status or 0) < 500):
+                    # it may have been filled all the same: USDT and coins then change with no order on the books.
+                    # The two sides cancel but for fee and slippage, which must not look like a withdrawal.
+                    self.state["flow_unsure"] = float(self.state.get("flow_unsure") or 0.0) + abs(d)
                 continue
             if r["qty"] <= 0:
                 continue
             side = "SELL" if d < 0 else "BUY"
+            self._own_fill(sym, side, r)
             rec = {"ts": now, "mode": self.ex.name, "sym": sym, "side": side, "qty": r["qty"], "quote": round(r["quote"], 6),
                    "avg": r["avg"], "fee": r["fee"], "target_w": round(w.get(sym, 0.0), 4), "order_id": r.get("order_id")}
             self.store.append("spot_trades.jsonl", rec)
@@ -703,7 +738,7 @@ class SpotManager:
             out.append("현물 잔고 없음")
         else:
             earn = v.get("earn", 0.0)
-            cash_pct = (v.get("usdt", 0.0) + earn) / eq * 100 if eq else 0
+            cash_pct = (v.get("usdt", 0.0) + earn + v.get("transit", 0.0)) / eq * 100 if eq else 0
             parked = f" (이자 예치 {earn / eq * 100:.0f}%)" if earn > 0.01 else ""
             out.append(f"현물 평가 ${eq:,.2f} | USDT {cash_pct:.0f}%{parked}")
             if detail:

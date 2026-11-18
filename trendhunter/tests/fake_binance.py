@@ -114,6 +114,7 @@ class FakeExchange:
         self.drop_order_response = 0    # futures: execute the order, then answer 503
         self.hide_order_lookups = 0     # futures: the next N lookups say "does not exist"
         self.funding_rate = None        # futures: set a rate (e.g. 0.0001) to serve /fapi/v1/fundingRate history
+        self.contract_type = {}         # futures: symbol -> contractType override (e.g. "TRADIFI_PERPETUAL")
         # ---- Simple Earn (flexible USDT)
         self.earn_usdt = 0.0
         self.earn_rewards = 0.0
@@ -122,6 +123,13 @@ class FakeExchange:
         self.earn_fail_redeem = False    # True: redeem answers an error
         self.earn_fail_subscribe = False
         self.earn_fail_read = False      # True: list / position answer 503
+        self.earn_drop_response = 0      # >0: carry out the next subscribe / redeem, then lose the answer
+        self.earn_redeem_delay = 0.0     # seconds until redeemed USDT shows up in the spot wallet
+        self.earn_landing = []           # [(due time, amount)] redeemed, not yet in the wallet
+        # ---- futures income history
+        self.income_rows_for_trades = True
+        self.income_fail = False         # True: /fapi/v1/income answers 503
+        self.income_lag_s = 0.0          # a row becomes visible this long after it was written
 
     # ------------------------------------------------------------ prices
     def _minute(self, ts_ms):
@@ -214,6 +222,11 @@ class FakeExchange:
         fee = qty * price * 0.0005
         self.wallet += realized - fee
         self.seq += 1
+        if self.income_rows_for_trades:  # like Binance: every change of the wallet has its income row
+            for kind, amt in (("REALIZED_PNL", realized), ("COMMISSION", -fee)):
+                if amt:
+                    self.income.append({"symbol": sym, "incomeType": kind, "income": f"{amt}", "asset": "USDT",
+                                        "time": t, "tranId": self.seq})
         self.trades.append({"id": self.seq, "orderId": self.seq, "symbol": sym, "side": side, "price": f"{price}",
                             "qty": f"{qty}", "realizedPnl": f"{realized}", "commission": f"{fee}",
                             "commissionAsset": "USDT", "time": t, "positionSide": "BOTH", "maker": False})
@@ -301,6 +314,9 @@ class FakeExchange:
             want = json.loads(P["symbols"]) if P.get("symbols") else ([P["symbol"]] if P.get("symbol") else self.symbols)
             return 200, [{"symbol": x, "price": f"{self.price(x)}"} for x in want]
         if path == "/api/v3/account":
+            for due, amt in [x for x in self.earn_landing if x[0] <= self.clock()]:
+                self.earn_landing.remove((due, amt))
+                self.spot_bal["USDT"] = self.spot_bal.get("USDT", 0.0) + amt
             return 200, {"balances": [{"asset": a, "free": f"{v:.8f}", "locked": "0.00000000"}
                                       for a, v in self.spot_bal.items() if v > 0 or P.get("omitZeroBalances") != "true"]}
         if path == "/sapi/v1/account/apiRestrictions":
@@ -373,6 +389,9 @@ class FakeExchange:
             self.earn_usdt += amt
             self.seq += 1
             self.earn_ops.append(("subscribe", dict(P)))
+            if self.earn_drop_response > 0:
+                self.earn_drop_response -= 1
+                return 599, {"code": -1007, "msg": "Timeout"}
             return 200, {"purchaseId": self.seq, "success": True}
         if op == "redeem" and method == "POST":
             if self.earn_fail_redeem:
@@ -381,9 +400,15 @@ class FakeExchange:
             if amt > self.earn_usdt + 1e-9:
                 return self.err(-6012, "Balance not enough")
             self.earn_usdt -= amt
-            self.spot_bal["USDT"] = self.spot_bal.get("USDT", 0.0) + amt
+            if self.earn_redeem_delay > 0:
+                self.earn_landing.append((self.clock() + self.earn_redeem_delay, amt))
+            else:
+                self.spot_bal["USDT"] = self.spot_bal.get("USDT", 0.0) + amt
             self.seq += 1
             self.earn_ops.append(("redeem", dict(P)))
+            if self.earn_drop_response > 0:
+                self.earn_drop_response -= 1
+                return 599, {"code": -1007, "msg": "Timeout"}
             return 200, {"redeemId": self.seq, "success": True}
         return 404, {"code": -5000, "msg": f"no route {op}"}
 
@@ -472,7 +497,8 @@ class FakeExchange:
             syms = []
             for s in self.symbols:
                 sp = SPECS[s]
-                syms.append({"symbol": s, "status": "TRADING", "contractType": "PERPETUAL", "filters": [
+                syms.append({"symbol": s, "status": "TRADING", "contractType": self.contract_type.get(s, "PERPETUAL"),
+                             "filters": [
                     {"filterType": "PRICE_FILTER", "tickSize": sp["tick"], "minPrice": "0.0001", "maxPrice": "1000000"},
                     {"filterType": "LOT_SIZE", "stepSize": sp["step"], "minQty": sp["min_qty"], "maxQty": "100000"},
                     {"filterType": "MARKET_LOT_SIZE", "stepSize": sp["step"], "minQty": sp["min_qty"], "maxQty": "50000"},
@@ -548,10 +574,14 @@ class FakeExchange:
                 return self.err(-4166, "The time between startTime and endTime cannot be longer than 7 days.")
             return 200, [t for t in self.trades if t["symbol"] == P["symbol"] and st <= t["time"] <= en][:int(P.get("limit", 500))]
         if path == "/fapi/v1/income":
+            if self.income_fail:
+                return 503, {"code": -1001, "msg": "Internal error; unable to process your request."}
             st = int(P.get("startTime", 0))
             en = int(P.get("endTime", 10 ** 15))
+            seen = int((self.clock() - self.income_lag_s) * 1000)
             return 200, [i for i in self.income if (not P.get("symbol") or i["symbol"] == P["symbol"])
-                         and (not P.get("incomeType") or i["incomeType"] == P["incomeType"]) and st <= i["time"] <= en]
+                         and (not P.get("incomeType") or i["incomeType"] == P["incomeType"])
+                         and st <= i["time"] <= min(en, seen)][:int(P.get("limit", 1000))]
         return 404, {"code": -5000, "msg": f"no route {path}"}
 
     def order(self, method, P, now_ms):
