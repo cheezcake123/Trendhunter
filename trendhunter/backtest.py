@@ -120,7 +120,8 @@ def load_data(api, cfg, days, cache_dir=None, now_ms=None, log=None):
                 log.warning("backtest data %s: %s", sym, e)
             continue
         try:
-            fund = fetch_funding(api, sym, start, now_ms, cache_dir)
+            # from three days earlier: the funding filter looks back that far at the first candles too
+            fund = fetch_funding(api, sym, start - S.FUNDING_WINDOW_H * 3_600_000, now_ms, cache_dir)
             fund = fund if fund[0] else None
         except (BinanceError, NetworkError, KeyError, TypeError, ValueError) as e:
             fund = None  # the simulation falls back to a flat, conservative funding charge
@@ -263,6 +264,10 @@ def simulate(cfg, pre, start_ms, risk_pct=None, start_equity=100.0, filters=None
                 continue
             sig = s["sigs"][i]
             if sig["side"]:
+                if s.get("funding") and S.funding_blocks(
+                        sig["side"], S.funding_avg_8h(*s["funding"], s["ind"]["tc"][i]), p):
+                    skips["FUNDING"] = skips.get("FUNDING", 0) + 1  # the same rule as the live bot
+                    continue
                 cands.append((sym, sig))
         cands.sort(key=lambda x: -x[1]["strength"])
         for sym, sig in cands:
@@ -352,6 +357,15 @@ def metrics(res):
 REASON_SHORT = {"STOP": "손절", "TRAIL": "추적", "TIME": "시간", "REVERSE": "반대", "END": "종료"}
 
 
+def funding_note(res, cfg):
+    """One line on the funding filter for the reports ('' when it did not apply)."""
+    n = (res.get("skips") or {}).get("FUNDING", 0)
+    lim = float(cfg.get("funding_max_pct", 0) or 0)
+    if lim <= 0 or res.get("funding_mode") == "flat":
+        return ""
+    return f"펀딩비 과열 필터(3일 평균 {lim:g}%/8시간 초과 시 진입 안 함): 건너뛴 신호 {n}회"
+
+
 def pyramid_note(cfg):
     n = int(cfg.get("pyramid_max_adds", 0) or 0)
     return f" · 불타기 최대 {n}회" if n > 0 else ""
@@ -371,6 +385,8 @@ def format_report(cfg, days, start_ms, end_ms, results, cur_risk, n_syms):
              f"[현재 설정: 1회 위험 {cur_risk:g}%{pyramid_note(cfg)}]",
              f"최종 {usd(m['final'])} ({m['ret']:+.1f}%) | 최대낙폭 {m['max_dd']:.1f}%",
              f"거래 {m['n']}회 · 승률 {m['win']:.0f}% · 평균 {m['avg_r']:+.2f}R · 수익팩터 {pf}"]
+    if funding_note(results[cur_risk], cfg):
+        lines.append(funding_note(results[cur_risk], cfg))
     if m["n"]:
         lines.append(f"평균 수익 {m['avg_win_r']:+.2f}R / 평균 손실 {m['avg_loss_r']:+.2f}R | 최장 연패 {m['streak']}회")
         lines.append(f"롱 {m['long'][0]}회 {m['long'][1]:+.2f}$ / 숏 {m['short'][0]}회 {m['short'][1]:+.2f}$")

@@ -2,15 +2,24 @@
 """전략 검증용 실험실: 저장소의 백테스트 코드(strategy.py / risk.py / backtest.py / spot_strategy.py)를
 실제 바이낸스 캔들에 그대로 돌려 설정을 비교한다. 봇과 함께 배포되지 않는다(zip 에 들어가지 않음).
 
-데이터: https://github.com/finom/static-klines 의 .klines-cache (바이낸스 현물 캔들, 10종목, 매일 갱신)
-    git clone --depth 1 https://github.com/finom/static-klines
-    python3 research/lab.py --klines static-klines/.klines-cache
+데이터
+- 현물 쪽: https://github.com/finom/static-klines 의 .klines-cache (바이낸스 현물 캔들, 10종목, 매일 갱신)
+      git clone --depth 1 https://github.com/finom/static-klines
+- 선물 쪽(권장): 이 저장소의 research/futures-data 브랜치. GitHub Actions 가 바이낸스 공개 데이터
+  (data.binance.vision)에서 선물 캔들과 실제 펀딩비 이력을 받아 research-data/ 에 저장한다
+  (research/fetch_futures_data.py, 다시 받으려면 그 브랜치의 Actions 에서 workflow 를 실행).
+      git clone --depth 1 -b research/futures-data https://github.com/cheezcake123/Trendhunter th-data
 
-한계: 선물 캔들 대신 현물 캔들을 쓰고(4시간봉 종가는 거의 같다), 펀딩비는 실제 기록 대신
---funding-bps (8시간당, 기본 3 = 0.03%) 고정값을 쓴다. 이 가정에서 v2.3 README 의 실제 펀딩비 결과
-(선물 연 +87% / 낙폭 -46%)와 거의 같은 값(+84% / -45%)이 나온다. 서버의 /backtest 는 실제 펀딩비를 쓴다.
+    python3 research/lab.py --klines static-klines/.klines-cache --futures-data th-data/research-data
+
+--futures-data 없이 돌리면 선물 쪽도 현물 캔들과 고정 펀딩비(--funding-bps)로 계산한다. 2026-11 비교에서
+이 방식은 서버 /backtest 1460 의 선물 결과(+320%)를 크게 과대평가했다(+881%). 선물 캔들은 저가가 현물보다
+평균 4~6bp 깊어 손절이 더 자주 걸리고, 작은 차이가 동시 포지션 제한·불타기·복리를 거치며 커진다.
+--futures-data 를 쓰면 서버 결과와 거의 같다(+321%, 거래 122회 / 서버 127회). 실제 펀딩비가 있어야
+펀딩비 과열 필터(strategy.funding_blocks)도 계산된다.
 """
 import argparse
+import gzip
 import json
 import math
 import os
@@ -25,7 +34,21 @@ import spot_strategy as SS  # noqa: E402
 import strategy as S  # noqa: E402
 
 DAY = 86_400_000
-_rows, _pre = {}, {}
+_rows, _pre, _fut = {}, {}, {}
+FUT_DIR = None  # --futures-data
+
+
+def fut_rows(sym, tf):
+    if (sym, tf) not in _fut:
+        with gzip.open(os.path.join(FUT_DIR, "futures-klines", sym, f"{tf}.json.gz"), "rt", encoding="utf-8") as fh:
+            _fut[(sym, tf)] = json.load(fh)
+    return _fut[(sym, tf)]
+
+
+def fut_funding(sym):
+    with gzip.open(os.path.join(FUT_DIR, "funding", f"{sym}.json.gz"), "rt", encoding="utf-8") as fh:
+        rows = sorted((int(t), float(r)) for t, r in json.load(fh))
+    return [t for t, _ in rows], [r for _, r in rows]
 
 
 def ms(y, m=1, d=1):
@@ -50,14 +73,16 @@ def rows(root, sym, tf):
 
 
 def run_futures(root, cfg, start_ms, end_ms, funding_bps, equity=10_000.0):
-    key = json.dumps({k: v for k, v in cfg.items() if k != "risk_per_trade_pct"}, sort_keys=True, default=str)
+    key = json.dumps({k: v for k, v in cfg.items() if k not in ("risk_per_trade_pct", "funding_max_pct")},
+                     sort_keys=True, default=str)
     if key not in _pre:
         data = {}
         for sym in cfg["symbols"]:
-            c1 = S.candles_from_klines(rows(root, sym, cfg["signal_tf"]), end_ms)
-            c4 = S.candles_from_klines(rows(root, sym, cfg["trend_tf"]), end_ms)
+            src = (lambda tf, s=sym: fut_rows(s, tf)) if FUT_DIR else (lambda tf, s=sym: rows(root, s, tf))
+            c1 = S.candles_from_klines(src(cfg["signal_tf"]), end_ms)
+            c4 = S.candles_from_klines(src(cfg["trend_tf"]), end_ms)
             if len(c1["c"]) > 300 and len(c4["c"]) > max(cfg["ma_periods"]) + 10:
-                data[sym] = {"c1": c1, "c4": c4, "funding": None}
+                data[sym] = {"c1": c1, "c4": c4, "funding": fut_funding(sym) if FUT_DIR else None}
         _pre[key] = BT.precompute(cfg, data)
     return BT.simulate(cfg, _pre[key], start_ms, None, equity, None, funding_bps_8h=funding_bps)
 
@@ -91,7 +116,10 @@ def main():
     ap.add_argument("--klines", required=True, help="static-klines 의 .klines-cache 폴더")
     ap.add_argument("--funding-bps", type=float, default=3.0, help="8시간당 펀딩비 가정(bp)")
     ap.add_argument("--start", type=int, default=2020)
+    ap.add_argument("--futures-data", help="research-data 폴더(선물 캔들 + 실제 펀딩비, 머리말 참고)")
     a = ap.parse_args()
+    global FUT_DIR
+    FUT_DIR = a.futures_data
     with open(os.path.join(APP, "config.json"), encoding="utf-8") as fh:
         cfg = json.load(fh)
     start, end = ms(a.start), max(int(r[0]) for r in rows(a.klines, "BTCUSDT", "1d")) + DAY
@@ -111,7 +139,9 @@ def main():
                        ("선물 위험 4%", {"risk_per_trade_pct": 4.0, "pyramid_max_adds": 0}),
                        ("선물 위험 2% + 불타기 2", {"risk_per_trade_pct": 2.0, "pyramid_max_adds": 2}),
                        ("선물 위험 2.5% + 불타기 2", {"risk_per_trade_pct": 2.5, "pyramid_max_adds": 2}),
-                       ("선물 위험 3% + 불타기 2", {"risk_per_trade_pct": 3.0, "pyramid_max_adds": 2})):
+                       ("선물 위험 3% + 불타기 2", {"risk_per_trade_pct": 3.0, "pyramid_max_adds": 2}),
+                       ("선물 3% + 불타기 2, 펀딩 필터 끔", {"risk_per_trade_pct": 3.0, "pyramid_max_adds": 2,
+                                                   "funding_max_pct": 0.0})):
         fut[name] = run_futures(a.klines, dict(cfg, **over), start, end, a.funding_bps)
         line(name, fut[name]["curve"])
     spot = run_spot(a.klines, cfg, start, end)

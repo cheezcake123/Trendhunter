@@ -1,6 +1,6 @@
 {
   "bot_name": "TrendHunter",
-  "version": "2.5.0",
+  "version": "2.6.0",
   "spot_enabled": true,
   "alloc_spot_pct": 50,
   "alloc_band_pct": 10,
@@ -84,6 +84,7 @@
   "max_leverage": 10,
   "max_margin_per_trade_pct": 30,
   "liq_buffer_mult": 2.0,
+  "funding_max_pct": 0.04,
   "max_open_positions": 3,
   "max_same_direction": 2,
   "max_entries_per_day": 4,

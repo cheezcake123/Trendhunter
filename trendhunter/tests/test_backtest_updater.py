@@ -73,7 +73,7 @@ class FundingTests(unittest.TestCase):
         fake = FakeExchange(clock, direction=1, history_days=420, test_days=1)
         fake.funding_rate = rate
         api = make_api(fake, clock)
-        cfg = dict(CFG, symbols=list(fake.symbols))
+        cfg = dict(CFG, symbols=list(fake.symbols), funding_max_pct=0.0)  # charging only (the filter: test_funding_filter)
         data, start = backtest.load_data(api, cfg, 120, cache_dir, int(START * 1000))
         pre = backtest.precompute(cfg, data)
         return backtest.simulate(cfg, pre, start, 3.0, 100.0), data, fake
