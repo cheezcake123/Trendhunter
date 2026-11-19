@@ -1,0 +1,30 @@
+name: Fetch futures research data
+
+# 연구용(봇과 무관): 바이낸스 공개 데이터에서 선물 캔들과 펀딩비 이력을 받아 이 브랜치에 저장한다.
+# research/futures-data 브랜치에서만 돈다. main 과 서버 배포(trendhunter.zip)에는 영향이 없다.
+on:
+  push:
+    branches: [research/futures-data]
+    paths: [".github/workflows/fetch-futures-data.yml", "research/fetch_futures_data.py"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python3 research/fetch_futures_data.py research-data
+      - name: Save the data to this branch
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add research-data
+          git commit -m "연구용 선물 캔들·펀딩비 데이터 갱신" || exit 0
+          git push
