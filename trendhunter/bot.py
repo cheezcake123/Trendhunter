@@ -79,6 +79,8 @@ FLOW_SPAN_MS = 2 * 3_600_000  # how far a transfer of the bot and its income row
 LEDGER_BASES = ("start_equity", "peak_equity", "day_start_equity")
 
 WHATS_NEW = {
+    "2.7.0": "🆕 v2.7 — /closeall 이 한 번에 정리합니다: '선물만 청산' 또는 '전부 정리하고 멈춤'(선물 포지션 청산 + 현물 "
+             "코인 전부 USDT로 매도 + 새 진입·현물 리밸런싱 정지). 다시 시작은 /resume.",
     "2.6.0": "🆕 v2.6 — 펀딩비 과열 필터: 최근 3일 평균 펀딩비가 8시간당 0.04%를 넘는 코인은 새로 롱 진입하지 않습니다"
              "(롱이 몰린 구간은 보유 비용이 크고 되돌림이 잦음). 실제 선물 데이터 7년 백테스트에서 연수익이 오르고 "
              "최대낙폭은 얕아졌습니다. 보유 중인 포지션과 불타기는 그대로입니다. 끄기: /set funding_max_pct 0",
@@ -94,7 +96,7 @@ COMMANDS = [
     ("status", "현재 상태·보유 포지션"), ("pnl", "손익 성과"), ("spot", "현물 보유·목표 비중"),
     ("alloc", "현물/선물 배분: /alloc 50"), ("preset", "위험 단계: /preset 기본"), ("scan", "종목별 신호 상태"),
     ("log", "최근 판단 기록"), ("pause", "신규 진입·불타기 일시정지"), ("resume", "신규 진입 재개"),
-    ("close", "포지션 청산: /close BTC"), ("closeall", "전체 청산"), ("risk", "1회 위험 변경: /risk 3"),
+    ("close", "포지션 청산: /close BTC"), ("closeall", "한 번에 정리: 선물만 / 현물까지 전부"), ("risk", "1회 위험 변경: /risk 3"),
     ("settings", "설정 보기"), ("set", "설정 변경: /set 키 값"), ("backtest", "백테스트: /backtest 365"),
     ("selftest", "계정·API 점검"), ("live", "실전 모드 전환"), ("paper", "모의 모드 전환"),
     ("update", "코드 업데이트"), ("rollback", "직전 버전 복구"), ("restart", "봇 재시작"),
@@ -1885,16 +1887,31 @@ class Trader:
         self.pending[nonce] = (action, args, self.now() + 180)
         self.send(text + "\n(3분 안에 눌러주세요)", inline=[[("✅ 실행", f"ok:{nonce}"), ("취소", f"no:{nonce}")]])
 
+    def choose(self, text, options):
+        """confirm() with several actions to pick from: options = [(label, action, *args)]. Picking one (or
+        cancelling) voids the other buttons of the same question."""
+        self.pending = {k: v for k, v in self.pending.items() if v[2] > self.now()}
+        group = pysecrets.token_hex(3)
+        rows = []
+        for label, action, *args in options:
+            nonce = pysecrets.token_hex(3)
+            self.pending[nonce] = (action, tuple(args), self.now() + 180, group)
+            rows.append([(label, f"ok:{nonce}")])
+        rows.append([("취소", f"no:{group}")])
+        self.send(text + "\n(3분 안에 눌러주세요)", inline=rows)
+
     def on_callback(self, data):
         kind, _, nonce = data.partition(":")
         item = self.pending.pop(nonce, None)
+        group = item[3] if item and len(item) > 3 else nonce
+        self.pending = {k: v for k, v in self.pending.items() if not (len(v) > 3 and v[3] == group)}
         if kind == "no":
             self.send("취소했습니다.")
             return
         if not item or item[2] < self.now():
             self.send("만료된 버튼입니다. 명령을 다시 보내주세요.")
             return
-        action, args, _ = item
+        action, args = item[0], item[1]
         getattr(self, f"act_{action}")(*args)
 
     # --- commands
@@ -1910,7 +1927,7 @@ class Trader:
             "📅 /report 지난달 리포트 (/report 이번달) — 매월 1일 자동 발송\n"
             "💵 /flows 입금·출금 기록 (실전은 자동 감지 · 놓친 것은 /deposit 100, /withdraw 100)\n"
             "⏸ /pause 신규 진입 정지 · ▶️ /resume 재개\n"
-            "/close BTC 한 종목 청산 · /closeall 전체 청산\n"
+            "/close BTC 한 종목 청산 · /closeall 한 번에 정리(선물만 / 현물까지 전부)\n"
             "/risk 3 — 1회 위험(%) 변경 · /settings 설정 보기 · /set 키 값\n"
             "/backtest 365 — 최근 N일 백테스트\n/selftest — API·계정 점검 (/selftest live: 실주문 왕복 테스트)\n"
             "/live 실전 전환 · /paper 모의 전환\n/update 업데이트 · /rollback 이전 버전 · /restart 재시작\n"
@@ -1920,6 +1937,8 @@ class Trader:
         eq = self.state.get("equity") or 0.0
         avail = self.state.get("available") or 0.0
         st = "⏸ 일시정지" if self.state.get("paused") else ("⚠️ 차단: " + self.state["blocked"] if self.state.get("blocked") else "정상 운영")
+        if (self.state.get("spot") or {}).get("halted"):
+            st += " · 현물 리밸런싱 멈춤(/resume)"
         L = self.ledger or {}
         lines = [f"📊 상태 — {self.mode_ko()} | {st}", self.total_line(),
                  f"[선물] 잔고 {usd(eq, False)} (가용 {usd(avail, False)}) | 오늘 실현 {usd(float(L.get('day_realized', 0)))}",
@@ -1999,7 +2018,8 @@ class Trader:
         st = self.state["spot"]
         uni = ", ".join(short(x) for x in st.get("universe") or []) or "(다음 리밸런싱 때 선정)"
         last = st.get("last_run")
-        lines = ["🪙 현물 — 추세 모멘텀 + 변동성 맞춤 비중 (레버리지 없음)",
+        lines = ["🪙 현물 — 추세 모멘텀 + 변동성 맞춤 비중 (레버리지 없음)"
+                 + (" — ⏸ 리밸런싱 멈춤(/resume)" if self.state["spot"].get("halted") else ""),
                  f"운용 종목(거래대금 상위 {self.cfg.get('spot_universe_size', 6)}): {uni}",
                  f"마지막 리밸런싱: {hhmm(last) if last else '아직 없음'} | 다음: 매일 09:05 KST",
                  self.spot.gate_line(), self.spot.earn_line()]
@@ -2342,9 +2362,13 @@ class Trader:
         self.send("⏸ 신규 진입과 불타기를 멈췄습니다. 보유 포지션 관리(손절·추적)는 계속합니다. 재개: /resume")
 
     def cmd_resume(self, args):
+        halted = bool((self.state.get("spot") or {}).get("halted"))
         self.state["paused"] = False
+        self.state.setdefault("spot", {})["halted"] = False
         self.save()
-        self.send("▶️ 신규 진입을 재개합니다.")
+        self.send("▶️ 신규 진입을 재개합니다."
+                  + ("\n현물 리밸런싱도 다시 시작합니다. 오늘 09:05 KST 점검이 지났으면 곧바로, 아니면 그때 목표 비중대로 "
+                     "다시 삽니다." if halted else ""))
 
     def _find_sym(self, word):
         w = word.upper()
@@ -2367,15 +2391,92 @@ class Trader:
         if sym in self.positions:
             self.exit_position(sym, "MANUAL")
 
+    def spot_coins(self):
+        """[(symbol, value)] of the coins the spot sleeve holds, and a note when they could not be read."""
+        if not self.cfg.get("spot_enabled", True):
+            return [], ""
+        if not (self.spot_ready and self.spot_mode_ok()):
+            return [], "현물 모듈이 아직 준비되지 않아 현물 보유는 확인하지 못했습니다."
+        try:
+            v = self.spot.value(refresh=True)
+        except (BinanceError, NetworkError) as e:
+            return [], f"현물 잔고를 읽지 못했습니다({e})."
+        return sorted(((s, h["val"]) for s, h in v["holdings"].items() if h["val"] >= 1.0), key=lambda x: -x[1]), ""
+
     def cmd_closeall(self, args):
-        if not self.positions:
-            self.send("보유 포지션이 없습니다.")
+        coins, note = self.spot_coins()
+        if not self.positions and not coins:
+            self.send("보유 중인 선물 포지션도, 정리할 현물 코인도 없습니다." + (f"\n{note}" if note else ""))
             return
-        self.confirm(f"보유 포지션 {len(self.positions)}개를 모두 시장가로 청산할까요?", "closeall")
+        lines = ["🧹 무엇을 정리할까요? (시장가 — 수수료와 약간의 슬리피지가 있습니다)"]
+        if self.positions:
+            lines.append(f"[선물] 포지션 {len(self.positions)}개: " + ", ".join(short(s) for s in self.positions))
+        if coins:
+            lines.append(f"[현물] 코인 {len(coins)}개, 약 {usd(sum(v for _, v in coins), False)}: "
+                         + ", ".join(f"{short(s)} {usd(v, False)}" for s, v in coins))
+        if note:
+            lines.append(note)
+        options = []
+        if self.positions:
+            lines.append("· 선물만 청산: 선물 포지션만 닫습니다. 새 신호가 나오면 다시 진입합니다(막으려면 /pause).")
+            options.append(("🔴 선물만 청산", "closeall"))
+        lines.append("· 전부 정리: 선물 포지션을 닫고 현물 코인을 모두 USDT로 판 뒤, 새 진입·불타기와 현물 "
+                     "리밸런싱을 멈춥니다. 다시 시작: /resume")
+        options.append(("🧹 전부 정리하고 멈춤", "exitall"))
+        self.choose("\n".join(lines), options)
 
     def act_closeall(self):
         for sym in list(self.positions):
             self.exit_position(sym, "MANUAL")
+
+    def act_exitall(self):
+        """Everything to USDT and stop: futures positions closed, the spot sleeve's coins sold, new entries and
+        the daily spot job halted until /resume. Futures first: they carry the leverage."""
+        now = self.now()
+        self.state["paused"] = True
+        self.state.setdefault("spot", {})["halted"] = True
+        self.save()
+        lines = ["🧹 전부 정리 결과"]
+        n = len(self.positions)
+        failed = [s for s in list(self.positions) if not self.exit_position(s, "MANUAL")]
+        if n:
+            lines.append(f"[선물] 포지션 {n - len(failed)}/{n}개 청산"
+                         + (f" — 실패: {', '.join(short(s) for s in failed)} (거래소 손절은 유지됩니다. /closeall 로 다시 "
+                            "시도하거나 앱에서 확인해 주세요)" if failed else ""))
+        else:
+            lines.append("[선물] 보유 포지션 없음")
+        if self.cfg.get("spot_enabled", True):
+            if self.spot_ready and self.spot_mode_ok() and not getattr(self, "spot_busy", False):
+                try:
+                    res = self.spot.liquidate(now)
+                except (BinanceError, NetworkError) as e:
+                    res = None
+                    lines.append(f"⚠️ [현물] 매도하지 못했습니다: {e}\n잠시 뒤 /closeall 로 다시 시도해 주세요.")
+                if res is not None:
+                    sold = res["trades"]
+                    if sold:
+                        lines.append(f"[현물] {len(sold)}개 매도 → {usd(sum(t['quote'] for t in sold), False)}: "
+                                     + ", ".join(f"{short(t['sym'])} {usd(t['quote'], False)}" for t in sold))
+                    elif not res["errors"] and not res["left"]:
+                        lines.append("[현물] 팔 코인 없음")
+                    for sym, err, unknown in res["errors"]:
+                        lines.append(f"⚠️ [현물] {short(sym)} " + ("매도 결과를 확인하지 못했습니다(다시 보내지 않음). 앱에서 "
+                                                              "잔고를 확인해 주세요." if unknown else f"매도 실패: {err}"))
+                    for sym, val, why in res["left"]:
+                        lines.append(f"[현물] {short(sym)} {usd(val, False)} 남음 ({why})")
+                    if any("최소 주문" in why for _, _, why in res["left"]):
+                        lines.append("  자투리는 바이낸스 앱의 '소액 자산 전환(BNB로 전환)'으로 정리할 수 있습니다.")
+                    try:
+                        lines.append(f"[현물] 지금 USDT {usd(self.spot.value(refresh=True)['usdt'], False)}"
+                                     + (" (+ 이자 예치 USDT는 그대로)" if self.spot.earn_touched() else ""))
+                    except (BinanceError, NetworkError):
+                        pass
+            else:
+                lines.append("⚠️ [현물] 현물 모듈이 준비되지 않아 코인을 팔지 못했습니다. 잠시 뒤 /closeall 로 다시 시도해 주세요.")
+        lines.append("⏸ 새 진입·불타기와 현물 리밸런싱을 멈췄습니다. 손절 관리는 계속합니다. 다시 시작: /resume")
+        self.event("EXIT_ALL", msg="; ".join(lines[1:])[:300])
+        self.save()
+        self.send("\n".join(lines))
 
     def cmd_risk(self, args):
         if not args:
