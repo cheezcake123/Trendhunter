@@ -225,6 +225,30 @@ def addon_due(pos, close, p):
 prepare_signal = None  # set below (readable aliases)
 
 
+FUNDING_WINDOW_H = 72  # the funding filter looks at the last three days
+
+
+def funding_avg_8h(times, rates, t_ms, hours=FUNDING_WINDOW_H):
+    """Average funding rate per 8 hours over the `hours` up to t_ms (rows settled at or before t_ms), so 8 h and
+    shorter funding intervals compare alike. times must be sorted. None when the window has no row."""
+    k = bisect.bisect_right(times, t_ms)
+    j = bisect.bisect_right(times, t_ms - hours * 3_600_000)
+    if k <= j:
+        return None
+    return sum(rates[j:k]) / (hours / 8.0)
+
+
+def funding_blocks(side, avg_8h, p):
+    """A crowded side is not entered: longs while the average funding rate is above funding_max_pct (per 8 h),
+    shorts while it is below minus that. Crowded longs pay for every candle they are held and tend to unwind
+    against a fresh breakout (research/lab.py --futures-data: better in both periods and with every symbol left
+    out). 0 switches it off; an unknown rate never blocks."""
+    lim = float(p.get("funding_max_pct", 0) or 0) / 100.0
+    if lim <= 0 or avg_8h is None:
+        return False
+    return avg_8h > lim if side == LONG else avg_8h < -lim
+
+
 def time_stop_due(opened_ms, now_ms, side, entry, extreme, r_dist, p):
     limit = float(p.get("time_stop_hours") or 0)
     if limit <= 0:  # 0 = time stop disabled

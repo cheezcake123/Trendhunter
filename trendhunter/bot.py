@@ -79,6 +79,9 @@ FLOW_SPAN_MS = 2 * 3_600_000  # how far a transfer of the bot and its income row
 LEDGER_BASES = ("start_equity", "peak_equity", "day_start_equity")
 
 WHATS_NEW = {
+    "2.6.0": "🆕 v2.6 — 펀딩비 과열 필터: 최근 3일 평균 펀딩비가 8시간당 0.04%를 넘는 코인은 새로 롱 진입하지 않습니다"
+             "(롱이 몰린 구간은 보유 비용이 크고 되돌림이 잦음). 실제 선물 데이터 7년 백테스트에서 연수익이 오르고 "
+             "최대낙폭은 얕아졌습니다. 보유 중인 포지션과 불타기는 그대로입니다. 끄기: /set funding_max_pct 0",
     "2.5.0": "🆕 v2.5 — 입금·출금을 봇이 스스로 알아챕니다(실전 모드, 10분 안). 수익률·최대낙폭·월간 리포트는 넣거나 뺀 "
              "돈을 빼고 계산하고, 새로 넣은 돈은 다음 09:05 KST 점검 때 현물·선물로 나눕니다.\n"
              "기록 보기: /flows · 잘못 잡힌 기록 취소: /flows undo · 입금 뒤 /rebase 는 이제 필요 없습니다.\n"
@@ -115,6 +118,7 @@ SETTABLE = {
     "pyramid_step_r": (float, 0.5, 5.0),
     "pyramid_risk_frac": (float, 0.1, 1.0),
     "liq_buffer_mult": (float, 0.0, 5.0),
+    "funding_max_pct": (float, 0.0, 1.0),
     "allow_short": (bool, None, None),
     "allow_long": (bool, None, None),
     "adx_min": (float, 0.0, 50.0),
@@ -245,6 +249,7 @@ class Trader:
         self.last_alert = {}
         self.candle_retry = None
         self.fetch_failed = set()  # symbols whose last klines call failed
+        self.funding_seen = {}     # (symbol, signal candle close ms) -> average funding rate (funding_ok)
 
     # ------------------------------------------------------------ basics
     @property
@@ -1504,6 +1509,8 @@ class Trader:
                  and (only is None or sym in only) and (not self.filters or self.plain_perp(sym))]
         cands.sort(key=lambda x: -x[1].get("strength", 0))
         for sym, sig in cands:
+            if not self.funding_ok(sym, sig):
+                continue
             eq = self.broker.equity()
             ok, code = R.can_enter(self.ledger, self.positions, sym, sig["side"], now, self.guard_equity(eq["equity"]),
                                    self.cfg, paused=self.state.get("paused"), blocked=bool(self.state.get("blocked")))
@@ -1511,6 +1518,34 @@ class Trader:
                 self.event("SKIP", sym=sym, side=sig["side"], code=code)
                 continue
             self.enter(sym, sig, eq)
+
+    def funding_ok(self, sym, sig):
+        """False while the funding filter says this side is crowded (strategy.funding_blocks). Read once per signal
+        candle. A funding history that cannot be read never blocks an entry: the bot then trades as before."""
+        if float(self.cfg.get("funding_max_pct", 0) or 0) <= 0:
+            return True
+        try:
+            tc = int((self.data.get(sym) or {})["ind"]["tc"][sig["i"]])
+        except (KeyError, IndexError, TypeError, ValueError):
+            return True
+        key = (sym, tc)
+        if key not in self.funding_seen:
+            try:
+                rows = self.api.funding_rates(sym, start_time=tc - S.FUNDING_WINDOW_H * 3_600_000, end_time=tc,
+                                              limit=100)
+                rows = sorted((int(r["fundingTime"]), float(r["fundingRate"])) for r in rows)
+            except (BinanceError, NetworkError, KeyError, TypeError, ValueError) as e:
+                self.log.warning("funding history %s: %s", sym, e)
+                return True  # asked again at the next look
+            self.funding_seen = {k: v for k, v in self.funding_seen.items() if k[1] >= tc - 2 * 86_400_000}
+            self.funding_seen[key] = S.funding_avg_8h([t for t, _ in rows], [r for _, r in rows], tc)
+            avg = self.funding_seen[key]
+            if S.funding_blocks(sig["side"], avg, self.cfg):
+                self.event("SKIP", sym=sym, side=sig["side"], code="FUNDING", funding=round(avg * 100, 4))
+                self.alert(f"funding_{sym}", f"⏸ {short(sym)} {SIDE_KO[sig['side']]} 신호 — 3일 평균 펀딩비 {avg * 100:+.3f}%"
+                           f"(8시간당)로 과열이라 진입하지 않습니다(기준 {float(self.cfg['funding_max_pct']):g}%, "
+                           "같은 코인은 하루 한 번만 알림).", every=86400)
+        return not S.funding_blocks(sig["side"], self.funding_seen[key], self.cfg)
 
     def enter(self, sym, sig, eq):
         side = sig["side"]
@@ -2352,7 +2387,7 @@ class Trader:
         keys = ["spot_enabled", "alloc_spot_pct", "alloc_band_pct", "spot_candidates", "spot_universe_size",
                 "spot_vol_target", "spot_band_pct", "spot_btc_gate", "spot_btc_gate_min", "spot_earn", "spot_cash_yield",
                 "symbols", "signal_tf", "trend_tf", "allow_long", "allow_short", "risk_per_trade_pct", "max_leverage", "max_open_positions", "max_same_direction",
-                "pyramid_max_adds", "pyramid_step_r", "pyramid_risk_frac", "liq_buffer_mult",
+                "pyramid_max_adds", "pyramid_step_r", "pyramid_risk_frac", "liq_buffer_mult", "funding_max_pct",
                 "max_entries_per_day", "daily_loss_limit_pct", "loss_streak_limit", "loss_streak_pause_hours",
                 "cooldown_after_loss_hours", "equity_floor_pct", "time_stop_hours", "adx_min",
                 "brief_morning_kst", "brief_evening_kst", "monthly_report", "flow_detect", "update_url"]
@@ -2832,11 +2867,11 @@ def check(data_dir):
     for key in ("symbols", "signal_tf", "trend_tf", "risk_per_trade_pct", "ma_periods",
                 "spot_candidates", "spot_lookbacks", "spot_vol_target", "alloc_spot_pct", "monthly_report",
                 "spot_btc_gate", "spot_btc_gate_min", "spot_earn", "spot_cash_yield",
-                "pyramid_max_adds", "pyramid_step_r", "pyramid_risk_frac", "liq_buffer_mult"):
+                "pyramid_max_adds", "pyramid_step_r", "pyramid_risk_frac", "liq_buffer_mult", "funding_max_pct"):
         if key not in cfg:
             raise SystemExit(f"config missing {key}")
     for key, lo, hi in (("pyramid_max_adds", 0, 3), ("pyramid_step_r", 0.5, 5.0), ("pyramid_risk_frac", 0.1, 1.0),
-                        ("liq_buffer_mult", 0.0, 5.0)):
+                        ("liq_buffer_mult", 0.0, 5.0), ("funding_max_pct", 0.0, 1.0)):
         v = cfg[key]
         if isinstance(v, bool) or not isinstance(v, (int, float)) or not lo <= v <= hi:
             raise SystemExit(f"bad {key} ({lo}~{hi})")
