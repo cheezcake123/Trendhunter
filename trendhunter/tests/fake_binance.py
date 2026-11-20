@@ -126,6 +126,18 @@ class FakeExchange:
         self.earn_drop_response = 0      # >0: carry out the next subscribe / redeem, then lose the answer
         self.earn_redeem_delay = 0.0     # seconds until redeemed USDT shows up in the spot wallet
         self.earn_landing = []           # [(due time, amount)] redeemed, not yet in the wallet
+        # ---- deposits and other wallets (v2.8, read only apart from FUNDING_MAIN)
+        self.networks = [  # USDT networks as /sapi/v1/capital/config/getall lists them
+            {"network": "TRX", "name": "Tron (TRC20)", "depositEnable": True, "minConfirm": 1, "busy": False},
+            {"network": "ETH", "name": "Ethereum (ERC20)", "depositEnable": True, "minConfirm": 6, "busy": False},
+            {"network": "KAIA", "name": "Kaia", "depositEnable": True, "minConfirm": 2, "busy": False},
+            {"network": "APT", "name": "Aptos", "depositEnable": True, "minConfirm": 1, "busy": False},
+        ]
+        self.deposits = []               # rows of /sapi/v1/capital/deposit/hisrec
+        self.wallet_fail = set()         # paths under /sapi/ that answer 503
+        self.funding_bal = {}            # funding wallet: asset -> free
+        self.earn_locked = []            # locked Simple Earn rows
+        self.other_wallets = {}          # e.g. {"Cross Margin": 12.5} (USDT) for /sapi/v1/asset/wallet/balance
         # ---- futures income history
         self.income_rows_for_trades = True
         self.income_fail = False         # True: /fapi/v1/income answers 503
@@ -343,6 +355,14 @@ class FakeExchange:
                     return self.err(-5013, "Asset transfer failed: insufficient balance")
                 self.wallet -= amt
                 self.spot_bal["USDT"] = self.spot_bal.get("USDT", 0.0) + amt
+            elif P["type"] == "FUNDING_MAIN":
+                if self.funding_bal.get(P["asset"], 0.0) + 1e-9 < amt:
+                    return self.err(-5013, "Asset transfer failed: insufficient balance")
+                self.funding_bal[P["asset"]] -= amt
+                self.spot_bal[P["asset"]] = self.spot_bal.get(P["asset"], 0.0) + amt
+                self.seq += 1
+                self.transfers.append({"type": P["type"], "amount": amt, "time": now_ms, "tranId": self.seq})
+                return 200, {"tranId": self.seq}
             else:
                 return self.err(-1102, "bad type")
             self.seq += 1
@@ -361,6 +381,37 @@ class FakeExchange:
             return 200, [t for t in self.spot_trades if t["symbol"] == P["symbol"]]
         if path.startswith("/sapi/v1/simple-earn/flexible/"):
             return self.earn_route(method, path.rsplit("/", 1)[-1], P)
+        return self.wallet_route(method, path, P, now_ms)
+
+    def wallet_route(self, method, path, P, now_ms):
+        if path in self.wallet_fail:
+            return 503, {"code": -1001, "msg": "Internal error; unable to process your request."}
+        if path == "/sapi/v1/capital/config/getall" and method == "GET":
+            return 200, [{"coin": "BTC", "networkList": [{"network": "BTC", "depositEnable": True}]},
+                         {"coin": "USDT", "networkList": [dict(n) for n in self.networks]}]
+        if path == "/sapi/v1/capital/deposit/address" and method == "GET":
+            n = next((x for x in self.networks if x["network"] == P["network"]), None)
+            if n is None:
+                return self.err(-4018, "This network is not supported for this coin.")
+            if not n["depositEnable"]:
+                return self.err(-4019, "Deposit is closed for this network.")
+            return 200, {"coin": P["coin"], "address": f"{P['network'].lower()}-addr-0001", "tag": n.get("tag", ""),
+                         "url": ""}
+        if path == "/sapi/v1/capital/deposit/hisrec" and method == "GET":
+            st = int(P.get("startTime") or 0)
+            rows = [dict(d) for d in self.deposits if d["insertTime"] >= st and d["coin"] == P.get("coin", "USDT")]
+            return 200, sorted(rows, key=lambda d: -d["insertTime"])[:int(P.get("limit", 1000))]
+        if path == "/sapi/v1/asset/get-funding-asset" and method == "POST":
+            return 200, [{"asset": a, "free": f"{v:.8f}", "locked": "0", "freeze": "0", "withdrawing": "0",
+                          "btcValuation": "0"} for a, v in self.funding_bal.items() if v > 0]
+        if path == "/sapi/v1/simple-earn/locked/position" and method == "GET":
+            return 200, {"total": len(self.earn_locked), "rows": list(self.earn_locked)}
+        if path == "/sapi/v1/asset/wallet/balance" and method == "GET":
+            if P.get("quoteAsset") != "USDT":
+                return self.err(-1102, "quoteAsset")
+            rows = [("Spot", self.spot_value() - self.earn_usdt), ("Funding", sum(self.funding_bal.values())), ("USDⓈ-M Futures", self.wallet + self.upnl()),
+                    ("Earn", self.earn_usdt)] + list(self.other_wallets.items())
+            return 200, [{"walletName": n, "balance": f"{v:.8f}", "activate": True} for n, v in rows]
         return 404, {"code": -5000, "msg": f"no route {path}"}
 
     def earn_route(self, method, op, P):
@@ -693,6 +744,27 @@ class FakeExchange:
         self.wallet += amount
         self.seq += 1
         self._transfer_income(amount, int(self.clock() * 1000))
+
+    def chain_deposit(self, amount, network="TRX", wallet_type=0):
+        """A USDT deposit seen on its chain: pending (status 0) until credit_deposit()."""
+        self.seq += 1
+        row = {"id": f"dep{self.seq}", "amount": f"{amount}", "coin": "USDT", "network": network, "status": 0,
+               "address": "x", "txId": f"tx{self.seq}", "insertTime": int(self.clock() * 1000), "confirmTimes": "0/1",
+               "unlockConfirm": 1, "walletType": wallet_type}
+        self.deposits.append(row)
+        return row["id"]
+
+    def credit_deposit(self, dep_id, status=1):
+        """The deposit is credited (status 1): the USDT lands in the spot (or funding) wallet."""
+        row = next(d for d in self.deposits if d["id"] == dep_id)
+        row["status"] = status
+        row["confirmTimes"] = "1/1"
+        if status in (1, 6):
+            amt = float(row["amount"])
+            if row["walletType"] == 1:
+                self.funding_bal["USDT"] = self.funding_bal.get("USDT", 0.0) + amt
+            else:
+                self.spot_bal["USDT"] = self.spot_bal.get("USDT", 0.0) + amt
 
     def open_algos(self, sym=None):
         return [a for a in self.algos.values() if a["algoStatus"] == "NEW" and (sym is None or a["symbol"] == sym)]

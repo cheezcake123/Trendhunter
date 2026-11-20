@@ -2,7 +2,8 @@
 
 Only what the spot sleeve needs: prices, daily klines, balances, MARKET orders, order lookup,
 trade history, universal transfer between the spot and USDⓈ-M futures wallets, API key restrictions,
-Simple Earn flexible products (idle USDT earns interest).
+Simple Earn flexible products (idle USDT earns interest), and read-only wallet views for /address and /balance
+(deposit networks, deposit address and history, every wallet's total). No withdrawal endpoint, on purpose.
 """
 from __future__ import annotations
 
@@ -114,6 +115,42 @@ class BinanceSpot(BinanceFutures):
         else:
             params["amount"] = amount
         return self._request("POST", "/sapi/v1/simple-earn/flexible/redeem", params, signed=True)
+
+    def earn_locked_position(self, retries=None):
+        """Locked Simple Earn holdings: rows of {asset, amount, ...}. Read only (shown by /balance)."""
+        r = self._request("GET", "/sapi/v1/simple-earn/locked/position", {"size": 100}, signed=True, retries=retries)
+        return (r or {}).get("rows") or []
+
+    # ------------------------------------------------------------ deposits and wallets (read only)
+    # Binance docs (Wallet > Capital / Asset): all USER_DATA, readable with the key's read permission. There is no
+    # withdrawal here on purpose: the bot never sends coins out of the account.
+    def coin_networks(self, coin="USDT"):
+        """The networks Binance takes `coin` on: rows of {network, name, depositEnable, depositDesc, minConfirm,
+        unLockConfirm, busy, ...} (GET /sapi/v1/capital/config/getall, IP weight 10)."""
+        for c in self._request("GET", "/sapi/v1/capital/config/getall", signed=True) or []:
+            if c.get("coin") == coin:
+                return c.get("networkList") or []
+        return []
+
+    def deposit_address(self, coin, network):
+        """{address, coin, tag, url} of this account for `coin` on `network` (IP weight 10)."""
+        return self._request("GET", "/sapi/v1/capital/deposit/address", {"coin": coin, "network": network},
+                             signed=True)
+
+    def deposit_history(self, coin="USDT", start_ms=None, limit=50, retries=None):
+        """Recent deposits, newest first: [{id, amount, coin, network, status, txId, insertTime, completeTime,
+        confirmTimes, unlockConfirm, walletType}]. status 0 pending, 6 credited (not yet withdrawable),
+        1 success, 7 wrong deposit, 8 waiting for the user's confirmation, 2 rejected (IP weight 1)."""
+        return self._request("GET", "/sapi/v1/capital/deposit/hisrec", {
+            "coin": coin, "startTime": start_ms, "limit": int(limit)}, signed=True, retries=retries) or []
+
+    def wallet_balance(self, quote="USDT"):
+        """Every wallet's total: [{walletName, balance, activate}] valued in `quote` (IP weight 60)."""
+        return self._request("GET", "/sapi/v1/asset/wallet/balance", {"quoteAsset": quote}, signed=True) or []
+
+    def funding_assets(self):
+        """Funding wallet: [{asset, free, locked, freeze, withdrawing, btcValuation}] (POST, USER_DATA)."""
+        return self._request("POST", "/sapi/v1/asset/get-funding-asset", {}, signed=True) or []
 
 
 def parse_spot_filters(exinfo, symbols=None):

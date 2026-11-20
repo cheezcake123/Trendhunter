@@ -57,8 +57,14 @@ class Telegram:
             parts.append(cur)
         return parts
 
-    def send(self, text, inline=None, keyboard=None, silent=False, chat_id=None):
-        """Never raises: a failed notification must not stop trading."""
+    @staticmethod
+    def button(text, data):
+        """data: callback string, or a dict with another button kind ({'web_app': {'url': ...}}, {'copy_text': ...})."""
+        return {"text": text, **data} if isinstance(data, dict) else {"text": text, "callback_data": data}
+
+    def send(self, text, inline=None, keyboard=None, silent=False, chat_id=None, html=False):
+        """Never raises: a failed notification must not stop trading. html=True: Telegram HTML (<b>, <code>);
+        the caller escapes the text."""
         cid = chat_id or self.chat_id
         if not cid:
             return None
@@ -67,10 +73,12 @@ class Telegram:
         for idx, chunk in enumerate(chunks):
             params = {"chat_id": cid, "text": chunk, "disable_web_page_preview": True,
                       "disable_notification": bool(silent)}
+            if html:
+                params["parse_mode"] = "HTML"
             if idx == len(chunks) - 1:
                 if inline:
                     params["reply_markup"] = {"inline_keyboard": [
-                        [{"text": t, "callback_data": d} for t, d in row] for row in inline]}
+                        [self.button(t, d) for t, d in row] for row in inline]}
                 elif keyboard:
                     params["reply_markup"] = {"keyboard": [[{"text": t} for t in row] for row in keyboard],
                                               "resize_keyboard": True, "is_persistent": True}
