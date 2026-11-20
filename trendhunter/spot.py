@@ -625,8 +625,8 @@ class SpotManager:
 
     # ------------------------------------------------------------ schedule
     def due(self, now):
-        if not self.cfg.get("spot_enabled", True):
-            return False
+        if not self.cfg.get("spot_enabled", True) or self.state.get("halted"):
+            return False  # halted: /closeall 'everything' sold the coins; /resume starts the daily job again
         if now < float(self.state.get("retry_at") or 0):
             return False
         secs = now % 86400
@@ -736,6 +736,48 @@ class SpotManager:
                           last_day=utc_day(now), fails=0, retry_at=0.0, last_run=now,
                           last_trades=[{"sym": x["sym"], "side": x["side"], "quote": x["quote"]} for x in done])
         return {"trades": done, "errors": errors, "targets": w, "diag": diag, "equity": E}
+
+    def liquidate(self, now):
+        """Sell every coin the sleeve holds for USDT (/closeall 'everything'). The same order path as the daily
+        job: fills are booked as the bot's own moves; an order whose outcome stays unknown is not sent again."""
+        v = self.value(refresh=True)
+        live = set(self.tradable())
+        done, errors, left = [], [], []
+        for sym, h in sorted(v["holdings"].items()):
+            f = self.filters.get(sym)
+            if sym not in live or not f or h["px"] <= 0:
+                if h["val"] >= 1.0:
+                    left.append((sym, h["val"], "거래 불가"))
+                continue
+            q = floor_step(h["free"], f["step"])
+            if q < float(f["min_qty"]) or q * h["px"] < float(f["min_notional"]):
+                if h["val"] >= 1.0:
+                    left.append((sym, h["val"], "거래소 최소 주문 단위보다 작음"))
+                continue
+            rest = (h["free"] - q) * h["px"]  # what the lot size leaves behind
+            try:
+                r = self.ex.order(sym, "SELL", qty=q, tag="X")
+            except (BinanceError, NetworkError) as e:
+                self.log.warning("spot sell-all %s: %s", sym, e)
+                unknown = not (isinstance(e, BinanceError) and (e.status or 0) < 500)
+                errors.append((sym, str(e)[:120], unknown))
+                if unknown:  # it may have been filled: see rebalance()
+                    self.state["flow_unsure"] = float(self.state.get("flow_unsure") or 0.0) + h["val"]
+                    self.cache = None
+                continue
+            if r["qty"] <= 0:
+                continue
+            self._own_fill(sym, "SELL", r)
+            if rest >= 1.0:
+                left.append((sym, rest, "거래소 최소 주문 단위보다 작음"))
+            rec = {"ts": now, "mode": self.ex.name, "sym": sym, "side": "SELL", "qty": r["qty"],
+                   "quote": round(r["quote"], 6), "avg": r["avg"], "fee": r["fee"], "target_w": 0.0,
+                   "order_id": r.get("order_id"), "why": "closeall"}
+            self.store.append("spot_trades.jsonl", rec)
+            done.append(rec)
+            self.cache = None
+        self.state.update(targets={}, last_trades=[{"sym": x["sym"], "side": "SELL", "quote": x["quote"]} for x in done])
+        return {"trades": done, "errors": errors, "left": left}
 
     # ------------------------------------------------------------ text
     def gate_line(self):

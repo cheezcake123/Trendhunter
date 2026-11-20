@@ -1,6 +1,6 @@
 {
   "bot_name": "TrendHunter",
-  "version": "2.6.0",
+  "version": "2.7.0",
   "spot_enabled": true,
   "alloc_spot_pct": 50,
   "alloc_band_pct": 10,
