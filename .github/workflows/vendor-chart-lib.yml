@@ -1,0 +1,34 @@
+name: Vendor chart library (one-off)
+
+# 임시 브랜치(tmp/vendor-chart-lib)에서 한 번만 돈다: 텔레그램 차트 페이지(docs/chart.html)가 쓸
+# lightweight-charts(Apache-2.0) 빌드 파일을 npm 에서 받아 이 브랜치에 올린다. main 과 서버 배포에는 영향 없음.
+on:
+  push:
+    branches: [tmp/vendor-chart-lib]
+    paths: [".github/workflows/vendor-chart-lib.yml"]
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          npm view lightweight-charts versions --json | tr -d '\n ' | tail -c 400; echo
+          npm pack "lightweight-charts@^4"
+          tar xzf lightweight-charts-*.tgz
+          mkdir -p vendor
+          cp package/dist/lightweight-charts.standalone.production.js vendor/
+          cp package/LICENSE vendor/LICENSE
+          cp package/NOTICE vendor/NOTICE 2>/dev/null || true
+          node -e "process.stdout.write(require('./package/package.json').version)" > vendor/VERSION
+          sha256sum vendor/* ; ls -la vendor package
+      - run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add vendor
+          git commit -m "차트 라이브러리 받기 (임시)"
+          git push
