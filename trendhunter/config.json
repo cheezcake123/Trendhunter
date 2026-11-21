@@ -1,6 +1,6 @@
 {
   "bot_name": "TrendHunter",
-  "version": "2.9.0",
+  "version": "2.9.1",
   "spot_enabled": true,
   "alloc_spot_pct": 50,
   "alloc_band_pct": 10,
@@ -73,7 +73,7 @@
   "max_stop_pct": 10.0,
   "trail_atr_mult": 5.0,
   "trail_min_step_atr": 0.25,
-  "breakeven_at_r": 1.5,
+  "breakeven_at_r": 1.25,
   "breakeven_lock_r": 0.2,
   "time_stop_hours": 0,
   "time_stop_min_r": 1.0,
