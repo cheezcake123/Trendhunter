@@ -85,6 +85,14 @@ class SignalTests(unittest.TestCase):
         s = S.trail_stop(S.SHORT, 100, 2.0, 102.0, 90.0, 1.0, CFG_)
         self.assertAlmostEqual(s, 93.0)
 
+    def test_breakeven_lock_at_one_and_a_quarter_r(self):
+        """v2.9.1: the default lock comes at 1.25R (1.5R before)."""
+        self.assertEqual(CFG["breakeven_at_r"], 1.25)
+        p = dict(CFG, trail_atr_mult=50.0)  # the chandelier far away: only the breakeven lock acts
+        self.assertEqual(S.trail_stop(S.LONG, 100, 2.0, 98.0, 102.4, 1.0, p), 98.0)        # 1.2R
+        self.assertAlmostEqual(S.trail_stop(S.LONG, 100, 2.0, 98.0, 102.5, 1.0, p), 100.4)  # 1.25R -> entry+0.2R
+        self.assertAlmostEqual(S.trail_stop(S.SHORT, 100, 2.0, 102.0, 97.5, 1.0, p), 99.6)
+
     def test_time_stop(self):
         h = 3_600_000
         p = dict(CFG, time_stop_hours=30)

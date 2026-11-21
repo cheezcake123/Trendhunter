@@ -68,11 +68,11 @@ PRESETS = {  # name: (spot %, futures risk per trade %, spot vol target, pyramid
     "기본": (50, 2.5, 0.6, 2),
     "공격": (40, 3.0, 0.6, 2),
 }
-PRESET_NOTE = {  # v2.8.1 rules, Binance FUTURES candles + real funding 2020-01 ~ 2026-11 (research/lab.py
+PRESET_NOTE = {  # v2.9.1 rules, Binance FUTURES candles + real funding 2020-01 ~ 2026-11 (research/lab.py
     # --futures-data), spot with Earn interest. Spot candles had overstated the futures side (v2.4 notes).
-    "안정": "과거 최대낙폭 약 -27%, 2024~ 연 38%, 2025~ 연 2%",
-    "기본": "과거 최대낙폭 약 -32%, 2024~ 연 52%, 2025~ 연 8%",
-    "공격": "과거 최대낙폭 약 -38%, 2024~ 연 65%, 2025~ 연 13%",
+    "안정": "과거 최대낙폭 약 -26%, 2024~ 연 39%, 2025~ 연 6%",
+    "기본": "과거 최대낙폭 약 -31%, 2024~ 연 54%, 2025~ 연 17%",
+    "공격": "과거 최대낙폭 약 -37%, 2024~ 연 69%, 2025~ 연 26%",
 }
 # Outside money (deposits, withdrawals, transfers made by hand in the app): see Trader.flow_pass
 FLOW_TYPES = ("TRANSFER", "INTERNAL_TRANSFER", "COIN_SWAP_DEPOSIT", "COIN_SWAP_WITHDRAW",
@@ -87,6 +87,9 @@ DEP_WATCH_S = 48 * 3600       # after /address: deposits are followed this long 
 DEP_EVERY_S = 120
 
 WHATS_NEW = {
+    "2.9.1": "🆕 v2.9.1 — 본전 보호를 1.5R → 1.25R에서 겁니다: 이익이 조금 덜 나도 손절을 본전 위로 올려, 올랐다가 "
+             "되돌아오는 포지션이 큰 손실로 끝나는 일을 줄입니다. 실제 선물 데이터(2020~2026-11)로 현물50:선물50 "
+             "위험 3%: 연 +118% → +134%, 최대낙폭 -35% → -34%, 2025~ 연 +10% → +21%. 2024년 한 해는 나빠졌습니다.",
     "2.9.0": "🆕 v2.9 — 🧹 /dust: 팔 수 없을 만큼 작은 자투리 코인을 BNB로 한 번에 정리(봇이 운용 중인 코인은 "
              "건드리지 않음, 확인 버튼 뒤 실행).\n💱 /kimp: 테더 김프(빗썸·업비트 USDT 가격 vs 달러 환율). "
              "/address 와 /balance 에도 한 줄로 나옵니다(잔고는 원화로도).",
