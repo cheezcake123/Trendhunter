@@ -67,10 +67,11 @@ PRESETS = {  # name: (spot %, futures risk per trade %, spot vol target, pyramid
     "기본": (50, 2.5, 0.6, 2),
     "공격": (40, 3.0, 0.6, 2),
 }
-PRESET_NOTE = {  # v2.4 rules on Binance candles 2020-01 ~ 2026-11, funding assumed 0.03% per 8h
-    "안정": "과거 최대낙폭 약 -28%, 2024~26 연 42%",
-    "기본": "과거 최대낙폭 약 -35%, 2024~26 연 60%",
-    "공격": "과거 최대낙폭 약 -41%, 2024~26 연 74%",
+PRESET_NOTE = {  # v2.8.1 rules, Binance FUTURES candles + real funding 2020-01 ~ 2026-11 (research/lab.py
+    # --futures-data), spot with Earn interest. Spot candles had overstated the futures side (v2.4 notes).
+    "안정": "과거 최대낙폭 약 -27%, 2024~ 연 38%, 2025~ 연 2%",
+    "기본": "과거 최대낙폭 약 -32%, 2024~ 연 52%, 2025~ 연 8%",
+    "공격": "과거 최대낙폭 약 -38%, 2024~ 연 65%, 2025~ 연 13%",
 }
 # Outside money (deposits, withdrawals, transfers made by hand in the app): see Trader.flow_pass
 FLOW_TYPES = ("TRANSFER", "INTERNAL_TRANSFER", "COIN_SWAP_DEPOSIT", "COIN_SWAP_WITHDRAW",
@@ -85,6 +86,9 @@ DEP_WATCH_S = 48 * 3600       # after /address: deposits are followed this long 
 DEP_EVERY_S = 120
 
 WHATS_NEW = {
+    "2.8.1": "🆕 v2.8.1 — 불타기 간격 1.5R → 2R: 이익이 조금 더 난 뒤에 추가합니다. 실제 선물 데이터(2020~2026-11)로 "
+             "전 구간에서 수익은 같거나 늘고 낙폭은 같거나 줄었습니다(현물50:선물50, 위험 3%, 불타기 2회: "
+             "2025~ 연 +1% → +10%). /preset 설명의 숫자도 실제 선물 데이터로 바꿨습니다.",
     "2.8.0": "🆕 v2.8 — 바이낸스 앱 없이 텔레그램에서:\n"
              "📈 /chart 보유 종목 실시간 차트(1분~1일봉, 진입가·손절가 표시, 주문 버튼 없음)\n"
              "📥 /address USDT 입금 주소(트론·카이아·앱토스, 점검 중인 네트워크 표시, 오는 중·도착 알림)\n"

@@ -140,6 +140,8 @@ def main():
                        ("선물 위험 2% + 불타기 2", {"risk_per_trade_pct": 2.0, "pyramid_max_adds": 2}),
                        ("선물 위험 2.5% + 불타기 2", {"risk_per_trade_pct": 2.5, "pyramid_max_adds": 2}),
                        ("선물 위험 3% + 불타기 2", {"risk_per_trade_pct": 3.0, "pyramid_max_adds": 2}),
+                       ("선물 3% + 불타기 2, 간격 1.5R(예전)", {"risk_per_trade_pct": 3.0, "pyramid_max_adds": 2,
+                                                       "pyramid_step_r": 1.5}),
                        ("선물 3% + 불타기 2, 펀딩 필터 끔", {"risk_per_trade_pct": 3.0, "pyramid_max_adds": 2,
                                                    "funding_max_pct": 0.0})):
         fut[name] = run_futures(a.klines, dict(cfg, **over), start, end, a.funding_bps)

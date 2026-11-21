@@ -77,6 +77,15 @@ class AddonRules(unittest.TestCase):
         self.assertTrue(S.addon_due(long_pos(last_add_px=None), 103.0, PYR), "older positions fall back to the entry")
         self.assertFalse(S.addon_due(long_pos(last_add_px=104.0), 106.9, PYR), "measured from the LAST add")
 
+    def test_default_spacing_is_two_r(self):
+        """v2.8.1: 2R on real futures data (1.5R added right when the breakeven lock kicks in)."""
+        self.assertEqual(CFG["pyramid_step_r"], 2.0)
+        p = dict(CFG, pyramid_max_adds=2)
+        self.assertFalse(S.addon_due(long_pos(), 103.9, p))                 # 100 + 2 x 2 = 104
+        self.assertTrue(S.addon_due(long_pos(), 104.0, p))
+        no_key = {k: v for k, v in p.items() if k != "pyramid_step_r"}
+        self.assertFalse(S.addon_due(long_pos(), 103.9, no_key), "the code's fallback matches the config")
+
     def test_due_short_mirror(self):
         sh = long_pos(side=S.SHORT, stop=99.5)
         self.assertTrue(S.addon_due(sh, 97.0, PYR))

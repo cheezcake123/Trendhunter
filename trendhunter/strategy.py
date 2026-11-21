@@ -217,7 +217,7 @@ def addon_due(pos, close, p):
         return False
     if not is_locked(pos["side"], pos["entry"], pos["stop"]):
         return False
-    step = float(p.get("pyramid_step_r", 1.5)) * float(pos["r_dist"])
+    step = float(p.get("pyramid_step_r", 2.0)) * float(pos["r_dist"])
     ref = float(pos.get("last_add_px") or pos["entry"])
     return close >= ref + step if pos["side"] == LONG else close <= ref - step
 
