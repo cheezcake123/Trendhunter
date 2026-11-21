@@ -1,8 +1,10 @@
-"""Wallet views for Telegram (v2.8): USDT deposit addresses, deposit progress and every wallet's balance.
+"""Wallet views for Telegram (v2.8): USDT deposit addresses, deposit progress and every wallet's balance;
+small balances -> BNB and the tether kimchi premium (v2.9).
 
-Meant for running the bot without the Binance app. Everything here only READS the account. The one thing that
-moves money is Trader.act_funding_to_spot (funding wallet -> spot wallet of the same account). There is no
-withdrawal anywhere: coins never leave the account through the bot.
+Meant for running the bot without the Binance app. Everything here only READS the account, except two moves
+inside the same account that the user confirms with a button: funding wallet -> spot wallet
+(Trader.act_funding_to_spot) and small balances -> BNB (Trader.act_dust). There is no withdrawal anywhere:
+coins never leave the account through the bot.
 """
 from __future__ import annotations
 
@@ -248,3 +250,109 @@ def balance_view(spot_api, fut_api):
             out["others"].append((OTHER_KO.get(name.lower(), name), float(w["balance"])))
     out["total"] = sum(out[k]["value"] for k in CORE_WALLETS if out[k]) + sum(v for _, v in out["others"])
     return out
+
+
+# ---------------------------------------------------------------- small balances -> BNB (/dust, v2.9)
+
+def dust_view(api, keep, prices):
+    """What can be turned into BNB, minus the coins the spot sleeve holds on purpose (`keep`: assets with a target).
+    {items: [(asset, qty, usd, bnb_after_fee)], kept: [asset], bnb, fee_pct}"""
+    r = api.dust_assets()
+    btc = float(prices.get("BTCUSDT") or 0.0)
+    items, kept = [], []
+    for d in r.get("details") or []:
+        a = str(d.get("asset") or "")
+        if not a or a in ("USDT", "BNB"):
+            continue
+        if a in keep:
+            kept.append(a)
+            continue
+        usd = float(d.get("toBTC") or 0.0) * btc if btc else None
+        items.append((a, float(d.get("amountFree") or 0.0), usd, float(d.get("toBNBOffExchange") or 0.0)))
+    items.sort(key=lambda x: -(x[2] or 0.0))
+    return {"items": items, "kept": sorted(kept), "bnb": sum(x[3] for x in items),
+            "fee_pct": float(r.get("dribbletPercentage") or 0.02) * 100}
+
+
+def dust_deltas(result, watched):
+    """The spot sleeve's own wallet change from a conversion: coins it watches went out, BNB came in for them.
+    BNB bought with coins outside the bot is new money for the sleeve, so it is left to the outside-money check."""
+    d = {}
+    for t in result.get("transferResult") or []:
+        a = str(t.get("fromAsset") or "")
+        if a not in watched:
+            continue
+        d[a] = d.get(a, 0.0) - float(t.get("amount") or 0.0)
+        if "BNB" in watched:
+            d["BNB"] = d.get("BNB", 0.0) + float(t.get("transferedAmount") or 0.0)
+    return d
+
+
+# ---------------------------------------------------------------- tether kimchi premium (/kimp, v2.9)
+# Public prices, no keys. The forex rate is Dunamu's (Upbit's) feed of the bank rate; a daily rate as a fallback.
+BITHUMB = ("https://api.bithumb.com/v1/ticker?markets=KRW-USDT", "https://api.bithumb.com/public/ticker/USDT_KRW")
+UPBIT = "https://api.upbit.com/v1/ticker?markets=KRW-USDT"
+FX = ("https://quotation-api-cdn.dunamu.com/v1/forex/recent?codes=FRX.KRWUSD", "https://open.er-api.com/v6/latest/USD")
+
+
+def fetch_json(url, timeout=5):
+    import json
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": "TrendHunter/kimp", "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def _first(get, urls, pick):
+    for u in urls:
+        try:
+            v = pick(get(u))
+            if v and float(v) > 0:
+                return float(v)
+        except Exception:  # noqa: BLE001 - any failure of a public source: try the next one
+            continue
+    return None
+
+
+def kimp_view(get):
+    """{bithumb, upbit, fx, fx_daily, premium} — None where a source could not be read."""
+    bithumb = _first(get, BITHUMB[:1], lambda j: j[0]["trade_price"]) or \
+        _first(get, BITHUMB[1:], lambda j: j["data"]["closing_price"])
+    upbit = _first(get, [UPBIT], lambda j: j[0]["trade_price"])
+    fx = _first(get, FX[:1], lambda j: j[0]["basePrice"])
+    daily = False
+    if fx is None:
+        fx, daily = _first(get, FX[1:], lambda j: j["rates"]["KRW"]), True
+    ref = bithumb or upbit
+    return {"bithumb": bithumb, "upbit": upbit, "fx": fx, "fx_daily": daily and fx is not None,
+            "premium": (ref / fx - 1) * 100 if ref and fx else None}
+
+
+def kimp_line(v):
+    """One line for /address and /balance ('' when it cannot be worked out)."""
+    if v.get("premium") is None:
+        return ""
+    ref = v["bithumb"] or v["upbit"]
+    return f"테더 김프 {v['premium']:+.1f}% (빗썸 {ref:,.0f}원 / 환율 {v['fx']:,.1f}원)"
+
+
+def kimp_text(v, when):
+    lines = [f"💱 테더 김프 ({when} KST)"]
+    prices = []
+    if v["bithumb"]:
+        prices.append(f"빗썸 {v['bithumb']:,.0f}원")
+    if v["upbit"]:
+        prices.append(f"업비트 {v['upbit']:,.0f}원")
+    lines.append("USDT 가격: " + (" · ".join(prices) if prices else "읽지 못함"))
+    lines.append(f"달러 환율: {v['fx']:,.1f}원" + (" (하루 한 번 갱신되는 값)" if v["fx_daily"] else " (은행 매매기준율)")
+                 if v["fx"] else "달러 환율: 읽지 못함")
+    p = v["premium"]
+    if p is None:
+        lines.append("⚠️ 지금은 김프를 계산할 수 없습니다. 잠시 뒤 다시 /kimp")
+        return "\n".join(lines)
+    lines.append(f"김프 {p:+.1f}%")
+    if p >= 0:
+        lines.append(f"빗썸에서 USDT를 사면 환율보다 {p:.1f}% 비싸게 삽니다(바이낸스로 보내는 돈의 비용).")
+    else:
+        lines.append(f"빗썸 USDT가 환율보다 {-p:.1f}% 쌉니다(역프).")
+    return "\n".join(lines)

@@ -138,6 +138,11 @@ class FakeExchange:
         self.funding_bal = {}            # funding wallet: asset -> free
         self.earn_locked = []            # locked Simple Earn rows
         self.other_wallets = {}          # e.g. {"Cross Margin": 12.5} (USDT) for /sapi/v1/asset/wallet/balance
+        self.dust_max_usd = 10.0         # coins worth less than this can be turned into BNB
+        self.bnb_px = 600.0              # BNB price when BNB is not one of the fake symbols
+        self.dust_calls = []             # assets of each /sapi/v1/asset/dust request
+        self.dust_error = None           # (code, msg): the next dust request is refused
+        self.dust_drop_response = 0      # >0: convert, then lose the answer
         # ---- futures income history
         self.income_rows_for_trades = True
         self.income_fail = False         # True: /fapi/v1/income answers 503
@@ -404,6 +409,43 @@ class FakeExchange:
         if path == "/sapi/v1/asset/get-funding-asset" and method == "POST":
             return 200, [{"asset": a, "free": f"{v:.8f}", "locked": "0", "freeze": "0", "withdrawing": "0",
                           "btcValuation": "0"} for a, v in self.funding_bal.items() if v > 0]
+        if path == "/sapi/v1/asset/dust-btc" and method == "POST":
+            btc = self.price("BTCUSDT") if "BTCUSDT" in self.symbols else 60000.0
+            det = []
+            for a, q in self.spot_bal.items():
+                if a in ("USDT", "BNB") or q <= 0 or a + "USDT" not in self.symbols:
+                    continue
+                usd = q * self.price(a + "USDT")
+                if usd < self.dust_max_usd:
+                    bnb = usd / self.bnb_value()
+                    det.append({"asset": a, "assetFullName": a, "amountFree": f"{q:.8f}", "toBTC": f"{usd / btc:.8f}",
+                                "toBNB": f"{bnb:.8f}", "toBNBOffExchange": f"{bnb * 0.98:.8f}",
+                                "exchange": f"{bnb * 0.02:.8f}"})
+            return 200, {"details": det, "totalTransferBtc": "0", "totalTransferBNB": f"{sum(float(d['toBNB']) for d in det):.8f}",
+                         "dribbletPercentage": "0.02"}
+        if path == "/sapi/v1/asset/dust" and method == "POST":
+            assets = [a for a in str(P.get("asset") or "").split(",") if a]
+            self.dust_calls.append(assets)
+            if self.dust_error:
+                code, msg = self.dust_error
+                self.dust_error = None
+                return self.err(code, msg)
+            res, total = [], 0.0
+            for a in assets:
+                q = self.spot_bal.get(a, 0.0)
+                if q <= 0:
+                    continue
+                bnb = q * self.price(a + "USDT") / self.bnb_value() * 0.98
+                self.spot_bal[a] = 0.0
+                self.spot_bal["BNB"] = self.spot_bal.get("BNB", 0.0) + bnb
+                self.seq += 1
+                total += bnb
+                res.append({"tranId": self.seq, "fromAsset": a, "amount": f"{q:.8f}", "transferedAmount": f"{bnb:.8f}",
+                            "serviceChargeAmount": f"{bnb / 49:.8f}", "operateTime": now_ms})
+            if self.dust_drop_response > 0:
+                self.dust_drop_response -= 1
+                return 599, {"code": -1007, "msg": "Timeout waiting for response from backend server."}
+            return 200, {"totalServiceCharge": "0", "totalTransfered": f"{total:.8f}", "transferResult": res}
         if path == "/sapi/v1/simple-earn/locked/position" and method == "GET":
             return 200, {"total": len(self.earn_locked), "rows": list(self.earn_locked)}
         if path == "/sapi/v1/asset/wallet/balance" and method == "GET":
@@ -744,6 +786,9 @@ class FakeExchange:
         self.wallet += amount
         self.seq += 1
         self._transfer_income(amount, int(self.clock() * 1000))
+
+    def bnb_value(self):
+        return self.price("BNBUSDT") if "BNBUSDT" in self.symbols else self.bnb_px
 
     def chain_deposit(self, amount, network="TRX", wallet_type=0):
         """A USDT deposit seen on its chain: pending (status 0) until credit_deposit()."""
