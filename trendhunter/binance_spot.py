@@ -2,8 +2,9 @@
 
 Only what the spot sleeve needs: prices, daily klines, balances, MARKET orders, order lookup,
 trade history, universal transfer between the spot and USDⓈ-M futures wallets, API key restrictions,
-Simple Earn flexible products (idle USDT earns interest), and read-only wallet views for /address and /balance
-(deposit networks, deposit address and history, every wallet's total). No withdrawal endpoint, on purpose.
+Simple Earn flexible products (idle USDT earns interest), read-only wallet views for /address and /balance
+(deposit networks, deposit address and history, every wallet's total) and small balances -> BNB (/dust).
+No withdrawal endpoint, on purpose.
 """
 from __future__ import annotations
 
@@ -151,6 +152,19 @@ class BinanceSpot(BinanceFutures):
     def funding_assets(self):
         """Funding wallet: [{asset, free, locked, freeze, withdrawing, btcValuation}] (POST, USER_DATA)."""
         return self._request("POST", "/sapi/v1/asset/get-funding-asset", {}, signed=True) or []
+
+    # ------------------------------------------------------------ small balances -> BNB (v2.9)
+    def dust_assets(self):
+        """What Binance would turn into BNB: {details: [{asset, amountFree, toBTC, toBNB, toBNBOffExchange,
+        exchange}], totalTransferBNB, dribbletPercentage} (POST /sapi/v1/asset/dust-btc, IP weight 1)."""
+        return self._request("POST", "/sapi/v1/asset/dust-btc", {"accountType": "SPOT"}, signed=True) or {}
+
+    def dust(self, assets):
+        """Turn these small balances into BNB (needs the trading permission). Returns {totalServiceCharge,
+        totalTransfered, transferResult: [{fromAsset, amount, transferedAmount, serviceChargeAmount, tranId}]}.
+        Never retried: a lost answer is reported, not sent again."""
+        return self._request("POST", "/sapi/v1/asset/dust", {"asset": ",".join(assets), "accountType": "SPOT"},
+                             signed=True, retries=0)
 
 
 def parse_spot_filters(exinfo, symbols=None):

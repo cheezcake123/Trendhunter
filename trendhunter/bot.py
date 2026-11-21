@@ -10,6 +10,7 @@ Capital is split between the two wallets (alloc_spot_pct) and rebalanced with un
 from __future__ import annotations
 
 import argparse
+import html
 import logging
 import logging.handlers
 import math
@@ -86,6 +87,9 @@ DEP_WATCH_S = 48 * 3600       # after /address: deposits are followed this long 
 DEP_EVERY_S = 120
 
 WHATS_NEW = {
+    "2.9.0": "🆕 v2.9 — 🧹 /dust: 팔 수 없을 만큼 작은 자투리 코인을 BNB로 한 번에 정리(봇이 운용 중인 코인은 "
+             "건드리지 않음, 확인 버튼 뒤 실행).\n💱 /kimp: 테더 김프(빗썸·업비트 USDT 가격 vs 달러 환율). "
+             "/address 와 /balance 에도 한 줄로 나옵니다(잔고는 원화로도).",
     "2.8.1": "🆕 v2.8.1 — 불타기 간격 1.5R → 2R: 이익이 조금 더 난 뒤에 추가합니다. 실제 선물 데이터(2020~2026-11)로 "
              "전 구간에서 수익은 같거나 늘고 낙폭은 같거나 줄었습니다(현물50:선물50, 위험 3%, 불타기 2회: "
              "2025~ 연 +1% → +10%). /preset 설명의 숫자도 실제 선물 데이터로 바꿨습니다.",
@@ -119,7 +123,8 @@ COMMANDS = [
     ("rebase", "자본 기준점 재설정"), ("export", "거래기록 CSV 받기"), ("report", "월간 리포트"),
     ("flows", "입금·출금 기록"), ("deposit", "놓친 입금 적기: /deposit 100"), ("withdraw", "놓친 출금 적기: /withdraw 100"),
     ("chart", "보유 종목 실시간 차트"), ("balance", "모든 지갑 잔고"), ("address", "USDT 입금 주소"),
-    ("cancel", "예약된 설정 변경 취소"), ("help", "도움말"),
+    ("cancel", "예약된 설정 변경 취소"), ("dust", "자투리 코인 BNB로 정리"), ("kimp", "테더 김프"),
+    ("help", "도움말"),
 ]
 SETTABLE = {
     "risk_per_trade_pct": (float, 0.25, 5.0),
@@ -253,6 +258,7 @@ class Trader:
         self.sleep = sleep
         self.public_api_factory = public_api_factory or (lambda: BinanceFutures(base_url=api.base))
         self.spot_api = spot_api
+        self.http_get = WL.fetch_json  # public prices for /kimp (tests replace it)
         self.spot_public_factory = spot_public_factory or (
             lambda: BinanceSpot(base_url=self.spot_api.base if self.spot_api else "https://api.binance.com"))
         self.spot = None
@@ -1966,6 +1972,7 @@ class Trader:
             "💵 /flows 입금·출금 기록 (실전은 자동 감지 · 놓친 것은 /deposit 100, /withdraw 100)\n"
             "📈 /chart 보유 종목 실시간 차트(보기 전용)\n💼 /balance 모든 지갑 잔고\n"
             "📥 /address USDT 입금 주소(트론·카이아·앱토스)\n"
+            "🧹 /dust 자투리 코인을 BNB로 · 💱 /kimp 테더 김프\n"
             "⏸ /pause 신규 진입 정지 · ▶️ /resume 재개\n"
             "/close BTC 한 종목 청산 · /closeall 한 번에 정리(선물만 / 현물까지 전부)\n"
             "/risk 3 — 1회 위험(%) 변경 · /settings 설정 보기 · /set 키 값\n"
@@ -2532,7 +2539,7 @@ class Trader:
                     for sym, val, why in res["left"]:
                         lines.append(f"[현물] {short(sym)} {usd(val, False)} 남음 ({why})")
                     if any("최소 주문" in why for _, _, why in res["left"]):
-                        lines.append("  자투리는 바이낸스 앱의 '소액 자산 전환(BNB로 전환)'으로 정리할 수 있습니다.")
+                        lines.append("  자투리는 /dust 로 BNB로 바꿀 수 있습니다(소액 자산 전환).")
                     try:
                         lines.append(f"[현물] 지금 USDT {usd(self.spot.value(refresh=True)['usdt'], False)}"
                                      + (" (+ 이자 예치 USDT는 그대로)" if self.spot.earn_touched() else ""))
@@ -2571,6 +2578,9 @@ class Trader:
         recent = sorted(rows or [], key=lambda r: -int(r.get("insertTime") or 0))[:3]
         buttons = [[(f"📋 {e['label']} 주소 복사", {"copy_text": {"text": e["address"]}})] for e in view if e["ok"]]
         text = WL.deposit_text(view, recent)
+        kimp = WL.kimp_line(WL.kimp_view(self.http_get))
+        if kimp:
+            text += "\n\n" + html.escape(kimp)
         if not self.send(text, inline=buttons or None, html=True):
             self.send(WL.plain(text))  # an older Telegram app or a formatting hiccup: the addresses still arrive
 
@@ -2625,7 +2635,10 @@ class Trader:
         lines = [f"💼 전체 잔고 — 바이낸스 계정 ({hhmm(self.now())} KST)"]
         if self.state["mode"] != "live":
             lines.append("모의 모드: 봇의 가상 잔고가 아니라 실제 계정 잔고입니다.")
-        lines.append(f"합계 약 {usd(v['total'], False)}" + (" (읽지 못한 지갑은 빠짐)" if v["errors"] else ""))
+        kv = WL.kimp_view(self.http_get)
+        won = kv["bithumb"] or kv["upbit"]
+        lines.append(f"합계 약 {usd(v['total'], False)}" + (f" ≈ {v['total'] * won / 10000:,.0f}만 원" if won else "")
+                     + (" (읽지 못한 지갑은 빠짐)" if v["errors"] else ""))
         sp = v["spot"]
         if sp:
             ours = [r for r in sp["assets"] if r[0] in mine]
@@ -2646,7 +2659,9 @@ class Trader:
         if v["errors"]:
             lines.append("⚠️ 읽지 못함: " + ", ".join(w for w, _ in v["errors"]) + " — 잠시 뒤 다시 /balance")
             self.log.warning("balance: %s", v["errors"])
-        lines.append("입금 주소: /address · 차트: /chart")
+        if WL.kimp_line(kv):
+            lines.append(WL.kimp_line(kv) + " — 원화는 빗썸 USDT 가격 기준")
+        lines.append("입금 주소: /address · 차트: /chart · 자투리 정리: /dust")
         self.send("\n".join(lines))
         fund = float(v.get("funding_usdt") or 0.0)
         if fund >= 1.0 and self.state["mode"] == "live":
@@ -2679,6 +2694,75 @@ class Trader:
                 self.spot.cache = None
         self.event("FUNDING_TO_SPOT", amount=free)
         self.send(f"✅ 펀딩 지갑 USDT {float(free):,.2f}를 현물 지갑으로 옮겼습니다. 봇이 10분 안에 입금으로 반영합니다.")
+
+    def cmd_kimp(self, args):
+        self.send(WL.kimp_text(WL.kimp_view(self.http_get), hhmm(self.now())))
+
+    def dust_keep(self):
+        """Coins the spot sleeve holds on purpose (a target weight): never turned into BNB."""
+        if not self.spot:
+            return set()
+        tg = self.spot.state.get("targets") or {}
+        return {(self.spot.filters.get(s) or {}).get("base") or short(s) for s, w in tg.items() if float(w or 0) > 0}
+
+    def cmd_dust(self, args):
+        api = self.spot_api_or_new()
+        if not api.key:
+            self.send("API 키가 없어 자투리를 읽을 수 없습니다.")
+            return
+        try:
+            v = WL.dust_view(api, self.dust_keep(), api.prices(["BTCUSDT"]))
+        except (BinanceError, NetworkError) as e:
+            self.send(f"⚠️ 자투리 목록을 읽지 못했습니다: {e}")
+            return
+        kept = f"\n봇이 운용 중인 코인은 건드리지 않습니다: {', '.join(v['kept'])}" if v["kept"] else ""
+        if not v["items"]:
+            self.send("BNB로 바꿀 자투리가 없습니다." + kept)
+            return
+        lines = ["🧹 자투리 정리 — BNB로 바꿀 수 있는 코인"]
+        for a, q, u, _ in v["items"][:15]:
+            lines.append(f"· {a} {q:.8g}" + (f" (약 {usd(u, False)})" if u is not None else ""))
+        if len(v["items"]) > 15:
+            lines.append(f"· 외 {len(v['items']) - 15}개")
+        lines.append(f"받는 BNB 약 {v['bnb']:.6f} (수수료 {v['fee_pct']:g}% 뺀 값){kept}")
+        if self.state["mode"] != "live":
+            self.send("\n".join(lines + ["모의 모드에서는 바꾸지 않습니다."]))
+            return
+        self.confirm("\n".join(lines + ["바꿀까요? 되돌릴 수 없습니다."]), "dust", [a for a, *_ in v["items"]])
+
+    def act_dust(self, assets):
+        if self.state["mode"] != "live":
+            self.send("모의 모드에서는 바꾸지 않습니다.")
+            return
+        api = self.spot_api_or_new()
+        try:  # read again: what the sleeve holds now is left alone, whatever the list said a minute ago
+            now_items = {a for a, *_ in WL.dust_view(api, self.dust_keep(), {})["items"]}
+        except (BinanceError, NetworkError) as e:
+            self.send(f"⚠️ 자투리 목록을 다시 읽지 못해 바꾸지 않았습니다: {e}")
+            return
+        todo = [a for a in assets if a in now_items]
+        if not todo:
+            self.send("바꿀 자투리가 없습니다(그사이 바뀌었습니다).")
+            return
+        try:
+            r = api.dust(todo)
+        except BinanceError as e:
+            self.send(f"⚠️ 바꾸지 못했습니다: {e}\n(바이낸스는 자투리 전환 횟수를 제한합니다. 몇 시간 뒤 다시 해 주세요)")
+            return
+        except NetworkError as e:
+            self.send(f"⚠️ 결과를 확인하지 못했습니다({e}). 다시 보내지 않습니다. 잠시 뒤 /balance 로 확인해 주세요.")
+            return
+        finally:
+            if self.spot:
+                self.spot.cache = None
+        if self.spot:
+            watched = {(self.spot.filters.get(s) or {}).get("base") for s in self.spot.known()}
+            self.spot.expect(WL.dust_deltas(r, watched))
+            self.spot.persist()
+        done = [t.get("fromAsset") for t in r.get("transferResult") or []]
+        self.event("DUST", msg=",".join(str(a) for a in done), amount=r.get("totalTransfered"))
+        self.send(f"✅ 자투리 {len(done)}개를 BNB {float(r.get('totalTransfered') or 0):.6f}로 바꿨습니다: "
+                  + ", ".join(str(a) for a in done))
 
     def chart_link(self, sym, market, pos=None):
         q = {"s": sym, "m": market}
