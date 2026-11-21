@@ -1,6 +1,6 @@
 {
   "bot_name": "TrendHunter",
-  "version": "2.7.0",
+  "version": "2.8.0",
   "spot_enabled": true,
   "alloc_spot_pct": 50,
   "alloc_band_pct": 10,
@@ -103,5 +103,12 @@
   "brief_evening_kst": "21:15",
   "monthly_report": true,
   "flow_detect": true,
-  "update_url": ""
+  "update_url": "",
+  "cool_off_hours": 24,
+  "deposit_networks": [
+    "TRX",
+    "KAIA",
+    "APT"
+  ],
+  "chart_url": "https://cheezcake123.github.io/Trendhunter/chart.html"
 }

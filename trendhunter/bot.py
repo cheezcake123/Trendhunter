@@ -27,6 +27,7 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 if APP_DIR not in sys.path:
     sys.path.insert(0, APP_DIR)
 
+import cooloff as CO  # noqa: E402
 import report as RP  # noqa: E402
 import risk as R  # noqa: E402
 import strategy as S  # noqa: E402
@@ -36,6 +37,7 @@ from brokers import LiveBroker, PaperBroker, _chunks  # noqa: E402
 from spot import SpotManager, utc_day  # noqa: E402
 from store import Store, load_config  # noqa: E402
 from telegram_client import Poller, Telegram  # noqa: E402
+import wallet as WL  # noqa: E402
 
 KST = timezone(timedelta(hours=9))
 TF_SECONDS = {"1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "2h": 7200,
@@ -55,9 +57,11 @@ EXIT_KO = {
     "EXTERNAL": "외부 청산(앱에서 직접 등)",
 }
 
-KEYBOARD = [["📊 상태", "💰 손익"], ["🪙 현물", "🔎 스캔"], ["📜 기록", "⚖️ 배분"], ["⏸ 정지", "▶️ 재개"], ["❓ 도움말"]]
+KEYBOARD = [["📊 상태", "💰 손익"], ["📈 차트", "💼 잔고"], ["🪙 현물", "🔎 스캔"], ["📜 기록", "⚖️ 배분"],
+            ["⏸ 정지", "▶️ 재개"], ["📥 입금 주소", "❓ 도움말"]]
 LABEL_CMD = {"📊 상태": "status", "💰 손익": "pnl", "🔎 스캔": "scan", "📜 기록": "log", "🪙 현물": "spot",
-             "⚖️ 배분": "alloc", "⏸ 정지": "pause", "▶️ 재개": "resume", "❓ 도움말": "help"}
+             "⚖️ 배분": "alloc", "⏸ 정지": "pause", "▶️ 재개": "resume", "❓ 도움말": "help",
+             "📈 차트": "chart", "💼 잔고": "balance", "📥 입금 주소": "address"}
 PRESETS = {  # name: (spot %, futures risk per trade %, spot vol target, pyramiding adds)
     "안정": (70, 2.0, 0.6, 2),
     "기본": (50, 2.5, 0.6, 2),
@@ -77,8 +81,16 @@ FLOW_RELEASE_S = FLOW_BACK_MS / 1000 + 60  # a change no row explains counts as 
 FLOW_GIVE_UP_S = 86400        # while the history cannot be read at all: a day at the very most
 FLOW_SPAN_MS = 2 * 3_600_000  # how far a transfer of the bot and its income row may lie apart
 LEDGER_BASES = ("start_equity", "peak_equity", "day_start_equity")
+DEP_WATCH_S = 48 * 3600       # after /address: deposits are followed this long (on the way / arrived)
+DEP_EVERY_S = 120
 
 WHATS_NEW = {
+    "2.8.0": "🆕 v2.8 — 바이낸스 앱 없이 텔레그램에서:\n"
+             "📈 /chart 보유 종목 실시간 차트(1분~1일봉, 진입가·손절가 표시, 주문 버튼 없음)\n"
+             "📥 /address USDT 입금 주소(트론·카이아·앱토스, 점검 중인 네트워크 표시, 오는 중·도착 알림)\n"
+             "💼 /balance 모든 지갑 잔고(현물·선물·이자 예치·펀딩, 봇 밖 코인까지)\n"
+             "⏳ 충동 방지: 위험을 키우는 설정 변경(1회 위험·레버리지·배분·공격 단계 등)은 24시간 뒤에 적용되고 "
+             "그 전에 /cancel 로 취소할 수 있습니다. 위험을 줄이는 변경은 바로 적용됩니다.",
     "2.7.0": "🆕 v2.7 — /closeall 이 한 번에 정리합니다: '선물만 청산' 또는 '전부 정리하고 멈춤'(선물 포지션 청산 + 현물 "
              "코인 전부 USDT로 매도 + 새 진입·현물 리밸런싱 정지). 다시 시작은 /resume.",
     "2.6.0": "🆕 v2.6 — 펀딩비 과열 필터: 최근 3일 평균 펀딩비가 8시간당 0.04%를 넘는 코인은 새로 롱 진입하지 않습니다"
@@ -102,7 +114,8 @@ COMMANDS = [
     ("update", "코드 업데이트"), ("rollback", "직전 버전 복구"), ("restart", "봇 재시작"),
     ("rebase", "자본 기준점 재설정"), ("export", "거래기록 CSV 받기"), ("report", "월간 리포트"),
     ("flows", "입금·출금 기록"), ("deposit", "놓친 입금 적기: /deposit 100"), ("withdraw", "놓친 출금 적기: /withdraw 100"),
-    ("help", "도움말"),
+    ("chart", "보유 종목 실시간 차트"), ("balance", "모든 지갑 잔고"), ("address", "USDT 입금 주소"),
+    ("cancel", "예약된 설정 변경 취소"), ("help", "도움말"),
 ]
 SETTABLE = {
     "risk_per_trade_pct": (float, 0.25, 5.0),
@@ -141,6 +154,9 @@ SETTABLE = {
     "brief_evening_kst": ("hhmm", None, None),
     "monthly_report": (bool, None, None),
     "flow_detect": (bool, None, None),
+    "cool_off_hours": (float, 0.0, 168.0),
+    "deposit_networks": ("netlist", None, None),
+    "chart_url": ("url", None, None),
 }
 
 
@@ -177,6 +193,22 @@ def px(x):
 
 def tfl(tf):
     return tf.upper()
+
+
+def netlist(raw):
+    """'trx, kaia,apt' -> ['TRX', 'KAIA', 'APT'] (Binance network codes, at most 4)."""
+    out = []
+    for w in str(raw).replace(" ", "").split(","):
+        w = w.upper()
+        if not w:
+            continue
+        if not (2 <= len(w) <= 20 and all(c.isalnum() or c == "_" for c in w)):
+            raise ValueError(f"{w}: 네트워크 이름은 영문·숫자 (예: TRX,KAIA,APT)")
+        if w not in out:
+            out.append(w)
+    if not out or len(out) > 4:
+        raise ValueError("네트워크를 1~4개 쉼표로 (예: TRX,KAIA,APT)")
+    return out
 
 
 def kst(ts):
@@ -480,6 +512,8 @@ class Trader:
         elif self.candle_retry:
             self.retry_candle(now, cur_open)
         self.spot_step(now)
+        self.cool_tick(now)
+        self.deposit_tick(now)
         if self.state.get("hist_day") != utc_day(now):
             self.record_daily(now)  # one total-equity row per UTC day, with or without the spot sleeve
         self.briefs(now)
@@ -1887,7 +1921,7 @@ class Trader:
         self.pending[nonce] = (action, args, self.now() + 180)
         self.send(text + "\n(3분 안에 눌러주세요)", inline=[[("✅ 실행", f"ok:{nonce}"), ("취소", f"no:{nonce}")]])
 
-    def choose(self, text, options):
+    def choose(self, text, options, cancel_label="취소"):
         """confirm() with several actions to pick from: options = [(label, action, *args)]. Picking one (or
         cancelling) voids the other buttons of the same question."""
         self.pending = {k: v for k, v in self.pending.items() if v[2] > self.now()}
@@ -1897,7 +1931,7 @@ class Trader:
             nonce = pysecrets.token_hex(3)
             self.pending[nonce] = (action, tuple(args), self.now() + 180, group)
             rows.append([(label, f"ok:{nonce}")])
-        rows.append([("취소", f"no:{group}")])
+        rows.append([(cancel_label, f"no:{group}")])
         self.send(text + "\n(3분 안에 눌러주세요)", inline=rows)
 
     def on_callback(self, data):
@@ -1926,9 +1960,12 @@ class Trader:
             "🔎 /scan 선물 종목별 신호 상태\n📜 /log 최근 판단 기록\n📁 /export 거래기록 CSV(세금 신고용)\n"
             "📅 /report 지난달 리포트 (/report 이번달) — 매월 1일 자동 발송\n"
             "💵 /flows 입금·출금 기록 (실전은 자동 감지 · 놓친 것은 /deposit 100, /withdraw 100)\n"
+            "📈 /chart 보유 종목 실시간 차트(보기 전용)\n💼 /balance 모든 지갑 잔고\n"
+            "📥 /address USDT 입금 주소(트론·카이아·앱토스)\n"
             "⏸ /pause 신규 진입 정지 · ▶️ /resume 재개\n"
             "/close BTC 한 종목 청산 · /closeall 한 번에 정리(선물만 / 현물까지 전부)\n"
             "/risk 3 — 1회 위험(%) 변경 · /settings 설정 보기 · /set 키 값\n"
+            f"⏳ 위험을 키우는 설정 변경은 기다렸다 적용(cool_off_hours {self.cool_hours():g}시간) · /cancel 취소\n"
             "/backtest 365 — 최근 N일 백테스트\n/selftest — API·계정 점검 (/selftest live: 실주문 왕복 테스트)\n"
             "/live 실전 전환 · /paper 모의 전환\n/update 업데이트 · /rollback 이전 버전 · /restart 재시작\n"
             "/rebase 자본 기준점(바닥선) 재설정", keyboard=KEYBOARD)
@@ -1948,6 +1985,8 @@ class Trader:
         tf = TF_SECONDS[self.cfg["signal_tf"]]
         nxt = (int(self.now() // tf) + 1) * tf
         lines.append(f"다음 판단: {kst(nxt).strftime('%H:%M')} KST ({self.cfg['signal_tf']} 마감)")
+        if self.state.get("cool"):
+            lines.append(f"⏳ 기다리는 설정 변경 {len(self.state['cool'])}건 — 보기·취소: /cancel")
         if self.cfg.get("spot_enabled", True):
             if self.spot_ready:
                 lines.append("[현물] 매일 09:05 KST 리밸런싱 — 자세히: /spot")
@@ -2050,12 +2089,21 @@ class Trader:
         except ValueError:
             self.send("사용법: /alloc 50  (현물 비중 %, 0~100)")
             return
-        self.confirm(f"목표 배분을 현물 {pct:g}% : 선물 {100 - pct:g}% 로 바꾸고 바로 맞출까요?", "alloc", pct)
+        if self.cool_hours() > 0 and CO.riskier("alloc_spot_pct", self.cfg.get("alloc_spot_pct"), pct):
+            text = (f"목표 배분을 현물 {pct:g}% : 선물 {100 - pct:g}% 로 바꿀까요?\n선물(레버리지) 쪽이 커지는 변경이라 "
+                    f"{self.cool_hours():g}시간 뒤에 적용합니다. 그 전에 /cancel 로 취소할 수 있습니다.")
+        else:
+            text = f"목표 배분을 현물 {pct:g}% : 선물 {100 - pct:g}% 로 바꾸고 바로 맞출까요?"
+        self.confirm(text, "alloc", pct)
 
     def act_alloc(self, pct):
-        self._save_setting("alloc_spot_pct", float(pct))
+        applied, queued, dropped = self.change_settings({"alloc_spot_pct": float(pct)}, "/alloc")
+        if queued:
+            self.send("\n".join(self.cool_lines(queued, dropped)))
+            return
         self.force_rebalance()
-        self.send(f"✅ 목표 배분 현물 {pct:g}% : 선물 {100 - pct:g}% — 다음 점검(1분 안)에 이체·리밸런싱합니다.")
+        self.send("\n".join([f"✅ 목표 배분 현물 {pct:g}% : 선물 {100 - pct:g}% — 다음 점검(1분 안)에 이체·리밸런싱합니다."]
+                            + self.cool_lines([], dropped)))
 
     def cmd_preset(self, args):
         cur = (float(self.cfg.get("alloc_spot_pct", 50)), float(self.cfg["risk_per_trade_pct"]),
@@ -2072,19 +2120,34 @@ class Trader:
             return
         name = args[0]
         sp, rk, vt, adds = PRESETS[name]
+        up = [k for k, v in self.preset_changes(name).items() if CO.riskier(k, self.cfg.get(k), v)]
+        wait = (f"\n위험이 커지는 부분({', '.join(up)})은 {self.cool_hours():g}시간 뒤에 적용합니다(충동 방지). 그 전에 "
+                "/cancel 로 취소할 수 있습니다." if up and self.cool_hours() > 0 else "")
         self.confirm(f"'{name}' 단계로 바꿀까요?\n현물 {sp}% : 선물 {100 - sp}% · 선물 1회 위험 {rk:g}% · 불타기 {adds}회 · "
-                     f"현물 변동성 목표 {vt:g}\n{PRESET_NOTE[name]}", "preset", name)
+                     f"현물 변동성 목표 {vt:g}\n{PRESET_NOTE[name]}{wait}", "preset", name)
+
+    @staticmethod
+    def preset_changes(name):
+        sp, rk, vt, adds = PRESETS[name]
+        return {"alloc_spot_pct": float(sp), "risk_per_trade_pct": float(rk), "spot_vol_target": float(vt),
+                "pyramid_max_adds": int(adds)}
 
     def act_preset(self, name):
         sp, rk, vt, adds = PRESETS[name]
-        self._save_setting("alloc_spot_pct", float(sp))
-        self._save_setting("risk_per_trade_pct", float(rk))
-        self._save_setting("spot_vol_target", float(vt))
-        self._save_setting("pyramid_max_adds", int(adds))
-        self.force_rebalance()
-        self.send(f"✅ '{name}' 단계 적용 — 현물 {sp}% : 선물 {100 - sp}%, 선물 1회 위험 {rk:g}%, 불타기 {adds}회. 곧 배분을 맞춥니다.")
+        applied, queued, dropped = self.change_settings(self.preset_changes(name), f"/preset {name}")
+        if applied:
+            self.force_rebalance()
+        if not queued:
+            self.send("\n".join([f"✅ '{name}' 단계 적용 — 현물 {sp}% : 선물 {100 - sp}%, 선물 1회 위험 {rk:g}%, 불타기 "
+                                 f"{adds}회. 곧 배분을 맞춥니다."] + self.cool_lines([], dropped)))
+            return
+        now_part = [f"{k} {CO.show(o)} → {CO.show(v)}" for k, o, v, _ in applied if o != v]
+        self.send("\n".join([f"🎚 '{name}' 단계"]
+                            + ([f"✅ 바로 적용: {', '.join(now_part)}"] if now_part else [])
+                            + self.cool_lines(queued, dropped)))
 
     def _save_setting(self, key, val):
+        """Store one setting as it is: no cooling-off and no follow-up (tests and internal use)."""
         settings = self.store.load_settings()
         settings[key] = val
         self.store.save_settings(settings)
@@ -2478,6 +2541,181 @@ class Trader:
         self.save()
         self.send("\n".join(lines))
 
+    # --- without the Binance app: deposit addresses, every wallet, charts (v2.8). Read only, except moving USDT
+    # from the funding wallet to the spot wallet of the same account. No withdrawal anywhere.
+    def cmd_address(self, args):
+        api = self.spot_api_or_new()
+        if not api.key:
+            self.send("API 키가 없어 입금 주소를 읽을 수 없습니다. 설치 때 넣은 키를 확인해 주세요(/selftest).")
+            return
+        codes = list(self.cfg.get("deposit_networks") or ["TRX", "KAIA", "APT"])
+        try:
+            view = WL.deposit_view(api, codes)
+        except (BinanceError, NetworkError) as e:
+            self.send(f"⚠️ 입금 정보를 읽지 못했습니다: {e}\n잠시 뒤 다시 시도해 주세요. 계속 안 되면 /selftest 로 점검해 주세요.")
+            return
+        now, rows = self.now(), None
+        W = self.state.get("dep_watch") or {"start_ms": self.now_ms(), "seen": {}}
+        W["until"], W["next"] = now + DEP_WATCH_S, now + DEP_EVERY_S
+        try:
+            rows = api.deposit_history(start_ms=self.now_ms() - 30 * 86_400_000, limit=20, retries=1)
+            WL.watch_pass(W, rows, W["start_ms"])  # what is there now is known: only changes from here on are told
+        except (BinanceError, NetworkError) as e:
+            self.log.warning("deposit history: %s", e)
+        self.state["dep_watch"] = W
+        self.save()
+        recent = sorted(rows or [], key=lambda r: -int(r.get("insertTime") or 0))[:3]
+        buttons = [[(f"📋 {e['label']} 주소 복사", {"copy_text": {"text": e["address"]}})] for e in view if e["ok"]]
+        text = WL.deposit_text(view, recent)
+        if not self.send(text, inline=buttons or None, html=True):
+            self.send(WL.plain(text))  # an older Telegram app or a formatting hiccup: the addresses still arrive
+
+    def deposit_tick(self, now):
+        """For two days after /address: tell when a USDT deposit is on its way and when it has arrived."""
+        W = self.state.get("dep_watch")
+        if not W:
+            return
+        if now > float(W.get("until") or 0):
+            self.state.pop("dep_watch", None)
+            return
+        if now < float(W.get("next") or 0):
+            return
+        W["next"] = now + DEP_EVERY_S
+        try:
+            rows = self.spot_api_or_new().deposit_history(start_ms=int(W["start_ms"]) - 3_600_000, limit=50, retries=0)
+        except (BinanceError, NetworkError) as e:
+            self.log.warning("deposit watch: %s", e)
+            return
+        for r, kind in WL.watch_pass(W, rows, int(W["start_ms"])):
+            self.event("DEPOSIT", what=kind, amount=r.get("amount"), network=r.get("network"), status=r.get("status"))
+            self.send(WL.watch_text(r, kind))
+
+    def bot_assets(self):
+        """Coins the spot sleeve trades (and USDT): everything else in the spot wallet is outside the bot."""
+        syms = list(self.spot.known()) if self.spot_ready and self.spot else list(self.cfg.get("spot_candidates") or [])
+        bases = {(self.spot.filters.get(s) or {}).get("base") if self.spot_ready and self.spot else None for s in syms}
+        return {b for b in bases if b} | {short(s) for s in syms} | {"USDT"}
+
+    def cmd_balance(self, args):
+        api = self.spot_api_or_new()
+        if not api.key:
+            self.send("API 키가 없어 계정 잔고를 읽을 수 없습니다.")
+            return
+        v = WL.balance_view(api, self.api)
+        mine = self.bot_assets()
+
+        def asset(a):
+            name, qty, val = a
+            if name == "USDT":
+                return f"USDT {qty:,.2f}"
+            return f"{name} {qty:.6g} " + (f"({usd(val, False)})" if val is not None else "(시세 없음)")
+
+        def assets(rows, limit=6):
+            rows = [r for r in rows if r[2] is None or r[2] >= 0.01]
+            text = " · ".join(asset(r) for r in rows[:limit])
+            if len(rows) > limit:
+                rest = rows[limit:]
+                text += f" 외 {len(rest)}개({usd(sum(r[2] or 0 for r in rest), False)})"
+            return text
+
+        lines = [f"💼 전체 잔고 — 바이낸스 계정 ({hhmm(self.now())} KST)"]
+        if self.state["mode"] != "live":
+            lines.append("모의 모드: 봇의 가상 잔고가 아니라 실제 계정 잔고입니다.")
+        lines.append(f"합계 약 {usd(v['total'], False)}" + (" (읽지 못한 지갑은 빠짐)" if v["errors"] else ""))
+        sp = v["spot"]
+        if sp:
+            ours = [r for r in sp["assets"] if r[0] in mine]
+            outside = [r for r in sp["assets"] if r[0] not in mine and (r[2] is None or r[2] >= 0.01)]
+            lines.append(f"· 현물 {usd(sp['value'], False)}" + (f" — {assets(ours)}" if ours else ""))
+            if outside:
+                lines.append(f"   봇이 관리하지 않는 코인: {assets(outside, 8)}")
+        f = v["futures"]
+        if f:
+            lines.append(f"· 선물(USDⓈ-M) {usd(f['value'], False)} — 지갑 {usd(f['wallet'], False)} · 미실현 {usd(f['upnl'])}"
+                         f" · 포지션 {f['n']}개")
+        for key, label in (("earn", "이자 예치(Earn)"), ("funding", "펀딩 지갑")):
+            b = v[key]
+            if b and (b["value"] >= 0.01 or b["assets"]):
+                lines.append(f"· {label} {usd(b['value'], False)}" + (f" — {assets(b['assets'])}" if b["assets"] else ""))
+        if v["others"]:
+            lines.append("· 그 밖의 지갑: " + ", ".join(f"{n} {usd(x, False)}" for n, x in v["others"]))
+        if v["errors"]:
+            lines.append("⚠️ 읽지 못함: " + ", ".join(w for w, _ in v["errors"]) + " — 잠시 뒤 다시 /balance")
+            self.log.warning("balance: %s", v["errors"])
+        lines.append("입금 주소: /address · 차트: /chart")
+        self.send("\n".join(lines))
+        fund = float(v.get("funding_usdt") or 0.0)
+        if fund >= 1.0 and self.state["mode"] == "live":
+            self.confirm(f"펀딩 지갑에 USDT {fund:,.2f}가 있습니다. 봇은 현물·선물 지갑만 씁니다.\n"
+                         "현물 지갑으로 옮길까요? (같은 계정 안의 이동이며, 봇은 입금으로 반영합니다)", "funding_to_spot")
+
+    def act_funding_to_spot(self):
+        if self.state["mode"] != "live":
+            self.send("모의 모드에서는 이체하지 않습니다.")
+            return
+        api = self.spot_api_or_new()
+        try:
+            free = next((r.get("free") for r in api.funding_assets() if r.get("asset") == "USDT"), "0")
+        except (BinanceError, NetworkError) as e:
+            self.send(f"⚠️ 펀딩 지갑을 읽지 못했습니다: {e}")
+            return
+        if float(free or 0) < 1.0:
+            self.send("펀딩 지갑에 옮길 USDT가 없습니다.")
+            return
+        try:
+            api.transfer("FUNDING_MAIN", "USDT", free)
+        except BinanceError as e:
+            self.send(f"⚠️ 옮기지 못했습니다: {e}\nAPI 키에 '범용 이체' 권한이 있는지 /selftest 로 확인해 주세요.")
+            return
+        except NetworkError as e:
+            self.send(f"⚠️ 이체 결과를 확인하지 못했습니다({e}). 다시 보내지 않습니다. 잠시 뒤 /balance 로 확인해 주세요.")
+            return
+        finally:
+            if self.spot:
+                self.spot.cache = None
+        self.event("FUNDING_TO_SPOT", amount=free)
+        self.send(f"✅ 펀딩 지갑 USDT {float(free):,.2f}를 현물 지갑으로 옮겼습니다. 봇이 10분 안에 입금으로 반영합니다.")
+
+    def chart_link(self, sym, market, pos=None):
+        q = {"s": sym, "m": market}
+        if pos:
+            q.update(side="L" if pos["side"] == S.LONG else "S", e=f"{pos['entry']:.10g}", sl=f"{pos['stop']:.10g}",
+                     t=int(float(pos.get("opened_ms") or 0) / 1000), at=int(self.now()))
+            if pos.get("init_stop") and abs(float(pos["init_stop"]) - float(pos["stop"])) > 1e-12:
+                q["isl"] = f"{pos['init_stop']:.10g}"
+            if float(pos.get("liq") or 0) > 0:
+                q["liq"] = f"{pos['liq']:.10g}"
+        import urllib.parse
+        base = str(self.cfg.get("chart_url") or "")
+        return base + ("&" if "?" in base else "?") + urllib.parse.urlencode(q)
+
+    def cmd_chart(self, args):
+        coins, note = self.spot_coins()
+        items = [(s, "f", p) for s, p in self.positions.items()] + [(s, "s", None) for s, _ in coins]
+        if args:
+            w = args[0].upper()
+            hit = [it for it in items if it[0] == w or short(it[0]) == w]
+            if not hit:
+                held = ", ".join(sorted({short(s) for s, _, _ in items})) or "없음"
+                self.send(f"{short(w) if w.endswith('USDT') else w}: 차트는 보유 종목만 볼 수 있습니다. 지금 보유: {held}")
+                return
+            items = hit
+        if not items:
+            self.send("보유 중인 종목이 없어 볼 차트가 없습니다. 차트는 보유 종목만 볼 수 있습니다." + (f"\n{note}" if note else ""))
+            return
+        rows = []
+        for sym, m, p in items[:12]:
+            label = f"📈 {short(sym)} 선물 {SIDE_KO[p['side']]}" if m == "f" else f"📈 {short(sym)} 현물"
+            rows.append([(label, {"web_app": {"url": self.chart_link(sym, m, p)}})])
+        lines = ["📈 실시간 차트 — 보유 종목만, 보기 전용(주문 버튼 없음)",
+                 "1분·5분·15분·1시간·4시간·1일봉. 선물은 평균 진입가·손절가·청산가(추정) 선이 함께 보입니다.",
+                 "손절가는 지금 기준입니다. 추적 손절이 움직인 뒤에는 /chart 를 다시 눌러 주세요."]
+        if note:
+            lines.append(note)
+        if not self.send("\n".join(lines), inline=rows):
+            # Mini App buttons only work in a private chat with the bot: fall back to opening the page in a browser
+            self.send("\n".join(lines), inline=[[(lab, {"url": d["web_app"]["url"]})] for (lab, d), in rows])
+
     def cmd_risk(self, args):
         if not args:
             self.send(f"현재 1회 위험: {self.cfg['risk_per_trade_pct']}% — 변경: /risk 2.5")
@@ -2491,13 +2729,17 @@ class Trader:
                 "pyramid_max_adds", "pyramid_step_r", "pyramid_risk_frac", "liq_buffer_mult", "funding_max_pct",
                 "max_entries_per_day", "daily_loss_limit_pct", "loss_streak_limit", "loss_streak_pause_hours",
                 "cooldown_after_loss_hours", "equity_floor_pct", "time_stop_hours", "adx_min",
-                "brief_morning_kst", "brief_evening_kst", "monthly_report", "flow_detect", "update_url"]
+                "brief_morning_kst", "brief_evening_kst", "monthly_report", "flow_detect", "cool_off_hours",
+                "deposit_networks", "chart_url", "update_url"]
         lines = ["⚙️ 설정 (변경: /set 키 값)"]
         for k in keys:
             v = self.cfg.get(k)
-            if k in ("symbols", "spot_candidates"):
+            if k in ("symbols", "spot_candidates", "deposit_networks"):
                 v = ",".join(short(s) for s in (v or []))
             lines.append(f"{k} = {v if v not in ('', None) else '(없음)'}")
+        lines += self.cool_list()
+        if self.cool_hours() > 0:
+            lines.append(f"위험을 키우는 변경은 {self.cool_hours():g}시간 뒤에 적용됩니다(cool_off_hours). 취소: /cancel")
         self.send("\n".join(lines))
 
     def cmd_set(self, args):
@@ -2552,11 +2794,135 @@ class Trader:
                 if not (0 <= hh < 24 and 0 <= mm < 60):
                     raise ValueError("HH:MM 형식")
                 val = f"{hh:02d}:{mm:02d}"
+            elif kind == "netlist":
+                val = netlist(raw)
+            elif kind == "url":
+                val = raw.strip()
+                if not val.startswith("https://") or " " in val:
+                    raise ValueError("https:// 로 시작하는 주소")
             else:
                 val = raw.strip()
         except ValueError as e:
             self.send(f"값 오류: {e}")
             return
+        applied, queued, dropped = self.change_settings({key: val}, f"/set {key}")
+        lines = [f"✅ {k} = {v} 로 바꿨습니다 (즉시 적용).{note}" for k, _, v, note in applied]
+        self.send("\n".join(lines + self.cool_lines(queued, dropped)))
+
+    # --- settings: what lowers the risk applies now, what raises it waits (cooloff.py)
+    def cool_hours(self):
+        return float(self.cfg.get("cool_off_hours", 24) or 0)
+
+    def change_settings(self, changes, why):
+        """Apply each change that does not raise the risk now; queue the others for cool_off_hours. A new request
+        for a key replaces its waiting one (the wait starts again). Returns (applied [(key, old, new, note)],
+        queued [(key, old, new, due, replaced)], dropped [(key, cancelled item)])."""
+        hours, now = self.cool_hours(), self.now()
+        C = self.state.setdefault("cool", {})
+        applied, queued, dropped = [], [], []
+        for key, val in changes.items():
+            old = self.cfg.get(key)
+            prev = C.pop(key, None)
+            if hours > 0 and CO.riskier(key, old, val):
+                C[key] = {"val": val, "old": old, "due": now + hours * 3600, "asked": now, "why": why, "warned": False}
+                queued.append((key, old, val, C[key]["due"], prev))
+                self.event("COOL", key=key, msg=f"{CO.show(old)} -> {CO.show(val)}")
+            else:
+                if prev:
+                    dropped.append((key, prev))
+                applied.append((key, old, val, self._apply_setting(key, val)))
+        self.save()
+        return applied, queued, dropped
+
+    def cool_lines(self, queued, dropped=()):
+        lines = []
+        for key, old, val, due, prev in queued:
+            what = "/rebase(자본 기준점 다시 잡기)" if key == CO.REBASE else f"{key}: {CO.show(old)} → {CO.show(val)}"
+            lines.append(f"⏳ {what} — {hhmm(due)} KST에 적용" + (" (앞의 예약을 바꿨습니다)" if prev else ""))
+        if queued:
+            lines.append(f"위험을 키우는 변경이라 {self.cool_hours():g}시간 뒤에 적용합니다(충동 방지). 그 전에 취소: /cancel")
+        for key, prev in dropped:
+            lines.append(f"↩️ 예약돼 있던 {key} → {CO.show(prev['val'])} 변경은 취소했습니다.")
+        return lines
+
+    def cool_list(self):
+        out = []
+        for key, it in sorted((self.state.get("cool") or {}).items(), key=lambda kv: kv[1]["due"]):
+            what = "/rebase(자본 기준점 다시 잡기)" if key == CO.REBASE else \
+                f"{key}: {CO.show(it['old'])} → {CO.show(it['val'])}"
+            out.append(f"⏳ {what} — {hhmm(it['due'])} KST 적용 예정")
+        return out
+
+    def cool_tick(self, now):
+        """Apply the waiting changes that are due; warn an hour before."""
+        C = self.state.get("cool") or {}
+        lines, rebalance = [], False
+        for key, it in sorted(C.items(), key=lambda kv: kv[1]["due"]):
+            if now < it["due"]:
+                if not it.get("warned") and now >= it["due"] - 3600 and it["due"] - it["asked"] > 2 * 3600:
+                    it["warned"] = True
+                    what = "/rebase" if key == CO.REBASE else f"{key} {CO.show(it['old'])} → {CO.show(it['val'])}"
+                    lines.append(f"⏳ 1시간 뒤 적용 예정: {what}. 그만두려면 /cancel")
+                continue
+            if key == CO.REBASE:
+                if not self.rebase_ready():
+                    it["due"] = now + 600  # needs both wallets: try again shortly
+                    continue
+                C.pop(key)
+                lines.append("⏰ 예약했던 /rebase 를 실행했습니다.\n" + self.rebase_now())
+                continue
+            C.pop(key)
+            old, val = self.cfg.get(key), it["val"]
+            try:
+                if key == "symbols" and self.filters:
+                    bad = [s for s in val if s not in self.filters or not self.plain_perp(s)]
+                    if bad:
+                        raise ValueError(", ".join(short(s) for s in bad) + " 는 지금 거래할 수 없습니다")
+                note = self._apply_setting(key, val)
+            except (ValueError, BinanceError, NetworkError) as e:
+                lines.append(f"⚠️ 예약했던 {key} 변경을 적용하지 못했습니다: {e}")
+                continue
+            rebalance = rebalance or key in ("alloc_spot_pct", "spot_vol_target")
+            lines.append(f"⏰ {key}: {CO.show(old)} → {CO.show(val)} 적용 ({hhmm(it['asked'])}에 요청).{note}")
+        if rebalance:
+            self.force_rebalance()
+        if lines:
+            self.save()
+            self.send("\n".join(lines))
+
+    def cmd_cancel(self, args):
+        C = self.state.get("cool") or {}
+        if not C:
+            self.send("기다리는 설정 변경이 없습니다.")
+            return
+        if args:
+            w = args[0]
+            key = "*" if w.lower() in ("all", "전부", "모두") else (CO.REBASE if w.lstrip("/") == "rebase" else w)
+            if key != "*" and key not in C:
+                self.send("사용법: /cancel (목록) · /cancel all · /cancel 키")
+                return
+            self.act_cool_cancel(key)
+            return
+        options = [(f"↩️ {'/rebase' if k == CO.REBASE else k} 취소", "cool_cancel", k) for k in C]
+        if len(C) > 1:
+            options.append(("↩️ 모두 취소", "cool_cancel", "*"))
+        self.choose("\n".join(["⏳ 기다리는 설정 변경 (위험을 키우는 변경은 기다렸다 적용합니다):"] + self.cool_list()),
+                    options, cancel_label="그대로 두기")
+
+    def act_cool_cancel(self, key):
+        C = self.state.get("cool") or {}
+        gone = [(k, C.pop(k)) for k in (list(C) if key == "*" else [key]) if k in C]
+        self.save()
+        if not gone:
+            self.send("취소할 예약이 없습니다(이미 적용됐거나 취소됨).")
+            return
+        for k, it in gone:
+            self.event("COOL_CANCEL", key=k, msg=CO.show(it.get("val")))
+        self.send("↩️ 취소했습니다: " + ", ".join("/rebase" if k == CO.REBASE else f"{k} → {CO.show(it['val'])}"
+                                                for k, it in gone) + "\n지금 설정은 그대로입니다.")
+
+    def _apply_setting(self, key, val):
+        """Save one setting and do what it needs right away. Returns a note for the reply."""
         waiting = self.flow_waiting() if key in ("flow_detect", "spot_enabled") else 0.0
         settings = self.store.load_settings()
         settings[key] = val
@@ -2585,15 +2951,36 @@ class Trader:
         if key == "flow_detect":
             self.flow_reset()  # switched on: watch from now on, not from where the watch stopped
         self.event("SET", key=key, msg=str(val))
-        self.send(f"✅ {key} = {val} 로 바꿨습니다 (즉시 적용).{note}")
+        return note
+
+    def rebase_ready(self):
+        # the new base needs both wallets: without the spot balance, money that reaches the spot wallet later
+        # could be counted neither as a deposit nor in the old base
+        return not (self.cfg.get("spot_enabled", True) and not (self.spot_ready and self.spot_mode_ok()))
 
     def cmd_rebase(self, args):
-        if self.cfg.get("spot_enabled", True) and not (self.spot_ready and self.spot_mode_ok()):
-            # the new base needs both wallets: without the spot balance, money that reaches the spot wallet later
-            # could be counted neither as a deposit nor in the old base
+        if not self.rebase_ready():
             self.send("현물 모듈이 아직 준비되지 않아 지금은 기준점을 다시 잡을 수 없습니다(현물 잔고를 읽어야 합니다). "
                       "몇 분 뒤 다시 시도해 주세요. 계속 안 되면 /selftest 로 점검해 주세요.")
             return
+        start = float((self.ledger or {}).get("start_equity") or 0.0)
+        eq = float(self.state.get("equity") or 0.0)
+        if self.cool_hours() > 0 and start > 0 and eq < start - 0.005:
+            # a lower base lowers the equity floor (and forgets the drawdown): the usual move after a loss
+            C = self.state.setdefault("cool", {})
+            prev = C.pop(CO.REBASE, None)
+            C[CO.REBASE] = {"val": None, "old": None, "due": self.now() + self.cool_hours() * 3600,
+                            "asked": self.now(), "why": "/rebase", "warned": False}
+            self.save()
+            self.send("\n".join([f"지금 선물 잔고 {usd(eq, False)}가 기준점 {usd(start, False)}보다 낮아, 기준점을 다시 잡으면 "
+                                 f"자본 바닥선이 {usd(start * self.cfg['equity_floor_pct'] / 100, False)} → "
+                                 f"{usd(eq * self.cfg['equity_floor_pct'] / 100, False)}로 내려갑니다."]
+                                + self.cool_lines([(CO.REBASE, None, None, C[CO.REBASE]["due"], prev)])
+                                + ["(적용할 때의 잔고로 다시 잡습니다. 입금·출금은 /rebase 없이도 봇이 스스로 반영합니다)"]))
+            return
+        self.send(self.rebase_now())
+
+    def rebase_now(self):
         # what is in the wallets now is the new base: none of it may be booked as a deposit later
         self.flow_reset()
         try:  # the balance as it is now, not as the last step saw it
@@ -2616,14 +3003,21 @@ class Trader:
                          "수익률을 지금부터 새로 재고 싶을 때 쓰세요. 입금·출금은 봇이 스스로 반영합니다.")
             except (BinanceError, NetworkError) as e:
                 extra = f"\n⚠️ 현물 평가 실패로 총자산 기준점은 그대로입니다: {e}"
+        (self.state.get("cool") or {}).pop(CO.REBASE, None)
         self.save()
-        self.send(f"✅ 선물 자본 기준점을 {usd(eq, False)}로 재설정했습니다. 바닥선 = "
-                  f"{usd(eq * self.cfg['equity_floor_pct'] / 100, False)}{extra}")
+        return (f"✅ 선물 자본 기준점을 {usd(eq, False)}로 재설정했습니다. 바닥선 = "
+                f"{usd(eq * self.cfg['equity_floor_pct'] / 100, False)}{extra}")
 
     # --- mode switching
     def cmd_live(self, args):
         if self.state["mode"] == "live":
             self.send("이미 실전 모드입니다.")
+            return
+        back = float(self.state.get("left_live_ts") or 0) + self.cool_hours() * 3600
+        if self.cool_hours() > 0 and self.now() < back:
+            # live -> paper -> live would start a new ledger at once: the equity floor and the guards forgotten
+            self.send(f"실전에서 모의로 바꾼 뒤 {self.cool_hours():g}시간 동안은 실전으로 돌아갈 수 없습니다(충동 방지). "
+                      f"{hhmm(back)} KST부터 /live 할 수 있습니다.")
             return
         import selftest
         res = selftest.run_checks(self.api, self.cfg, self.cfg["symbols"], fix=False)
@@ -2733,13 +3127,15 @@ class Trader:
         if self.positions:
             self.send("실전 포지션이 남아 있습니다. 먼저 /closeall 로 정리한 뒤 전환하세요.")
             return
-        self.confirm("모의 모드로 전환할까요? (가상 잔고로 새로 시작)", "go_paper")
+        wait = (f"\n실전으로 다시 돌아오는 것은 {self.cool_hours():g}시간 뒤부터 할 수 있습니다(충동 방지)."
+                if self.cool_hours() > 0 else "")
+        self.confirm("모의 모드로 전환할까요? (가상 잔고로 새로 시작)" + wait, "go_paper")
 
     def act_go_paper(self):
         if self.positions:
             self.send("실전 포지션이 남아 있어 전환을 취소했습니다.")
             return
-        self.state.update(mode="paper", positions={})
+        self.state.update(mode="paper", positions={}, left_live_ts=self.now())
         self.broker = self.make_broker()
         self.broker.reset()
         eq = self.broker.equity()
@@ -2963,6 +3359,8 @@ def check(data_dir):
     import spot  # noqa: F401
     import spot_strategy  # noqa: F401
     import updater  # noqa: F401
+    import wallet  # noqa: F401
+    import cooloff  # noqa: F401
     store = Store(data_dir)
     cfg = load_config(APP_DIR, store)
     for key in ("symbols", "signal_tf", "trend_tf", "risk_per_trade_pct", "ma_periods",
@@ -2996,6 +3394,16 @@ def check(data_dir):
         raise SystemExit("bad spot_cash_yield (0~0.3)")
     if cfg["signal_tf"] not in TF_SECONDS or cfg["trend_tf"] not in TF_SECONDS:
         raise SystemExit("bad timeframe")
+    v = cfg.get("cool_off_hours")
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 <= v <= 168:
+        raise SystemExit("bad or missing cool_off_hours (0~168)")
+    try:
+        if netlist(",".join(cfg.get("deposit_networks") or [])) != list(cfg["deposit_networks"]):
+            raise ValueError
+    except (ValueError, TypeError):
+        raise SystemExit("bad or missing deposit_networks (e.g. [\"TRX\", \"KAIA\", \"APT\"])")
+    if not isinstance(cfg.get("chart_url"), str) or not cfg["chart_url"].startswith("https://"):
+        raise SystemExit("bad or missing chart_url (https://...)")
     print(f"OK {cfg['bot_name']} {cfg['version']}")
     return 0
 

@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<title>TrendHunter 차트</title>
+<!--
+  TrendHunter /chart: a view-only chart opened from Telegram (Mini App). No orders, no keys, no account data:
+  candles come straight from Binance's public market data, the lines (entry, stop, liquidation) from the button's
+  link. Served by GitHub Pages from this repository's docs/ folder; it is not part of the bot zip.
+-->
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1e2329; --muted: #707a8a; --line: #eaecef; --chip: #f5f5f5;
+    --up: #0ecb81; --down: #f6465d; --entry: #f0b90b; --stop: #f6465d; --protect: #0ecb81; --liq: #a259ff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0b0e11; --fg: #eaecef; --muted: #848e9c; --line: #2b3139; --chip: #1e2329;
+    }
+  }
+  :root[data-theme="dark"] { --bg: #0b0e11; --fg: #eaecef; --muted: #848e9c; --line: #2b3139; --chip: #1e2329; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); overflow: hidden;
+    font: 14px/1.35 -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Noto Sans KR", "Segoe UI", Roboto, sans-serif;
+    -webkit-tap-highlight-color: transparent; }
+  #app { display: flex; flex-direction: column; height: 100%; padding: 0 0 env(safe-area-inset-bottom); }
+  header { padding: 10px 12px 6px; }
+  .row { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  #title { font-weight: 700; font-size: 16px; }
+  .tag { font-size: 11px; padding: 1px 6px; border-radius: 4px; background: var(--chip); color: var(--muted); }
+  .tag.long { color: var(--up); } .tag.short { color: var(--down); }
+  #price { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; margin-top: 2px; }
+  #chg { font-size: 13px; font-variant-numeric: tabular-nums; }
+  .up { color: var(--up); } .down { color: var(--down); }
+  nav { display: flex; gap: 4px; padding: 4px 8px 6px; border-bottom: 1px solid var(--line); overflow-x: auto; }
+  nav button { flex: 0 0 auto; border: 0; background: transparent; color: var(--muted); font: inherit; font-size: 13px;
+    padding: 6px 10px; border-radius: 6px; min-height: 32px; }
+  nav button[aria-pressed="true"] { color: var(--fg); background: var(--chip); font-weight: 600; }
+  #chart { position: relative; flex: 1 1 auto; min-height: 200px; }
+  #legend { display: flex; flex-wrap: wrap; gap: 4px 12px; padding: 6px 12px 0; font-size: 12px;
+    font-variant-numeric: tabular-nums; }
+  #legend span { white-space: nowrap; }
+  #legend i { display: inline-block; width: 10px; height: 2px; vertical-align: middle; margin-right: 4px; }
+  footer { padding: 4px 12px 8px; font-size: 11px; color: var(--muted); display: flex; justify-content: space-between;
+    gap: 8px; flex-wrap: wrap; }
+  #msg { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; flex-direction: column;
+    gap: 10px; text-align: center; padding: 24px; color: var(--muted); z-index: 5; background: var(--bg); }
+  #msg button { border: 1px solid var(--line); background: var(--chip); color: var(--fg); font: inherit;
+    padding: 8px 16px; border-radius: 8px; }
+  #live::before { content: "●"; margin-right: 4px; color: var(--muted); }
+  #live.on::before { color: var(--up); }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <div class="row"><span id="title">-</span><span id="kind" class="tag"></span><span class="tag">보기 전용</span></div>
+    <div class="row"><span id="price">-</span><span id="chg"></span></div>
+  </header>
+  <nav id="tfs" aria-label="봉 간격"></nav>
+  <div id="chart"><div id="msg"><div id="msgText"></div><button id="retry" type="button">다시 불러오기</button></div></div>
+  <div id="legend"></div>
+  <footer><span id="note"></span><span id="live">연결 중</span></footer>
+</div>
+<script async src="https://telegram.org/js/telegram-web-app.js" onload="window.__thTg && window.__thTg()"></script>
+<script src="vendor/lightweight-charts-4.2.3.standalone.production.js"></script>
+<script>
+(function () {
+  "use strict";
+  var TF = [["1m", "1분", 60], ["5m", "5분", 300], ["15m", "15분", 900], ["1h", "1시간", 3600],
+            ["4h", "4시간", 14400], ["1d", "1일", 86400]];
+  var q = new URLSearchParams(location.search);
+  var sym = (q.get("s") || "BTCUSDT").toUpperCase();
+  if (!/^[A-Z0-9]{2,24}$/.test(sym)) sym = "BTCUSDT";
+  var fut = q.get("m") !== "s";
+  function num(k) { var v = parseFloat(q.get(k)); return isFinite(v) && v > 0 ? v : null; }
+  var side = q.get("side") === "S" ? "S" : (q.get("side") === "L" ? "L" : null);
+  var entry = num("e"), stop = num("sl"), initStop = num("isl"), liq = num("liq");
+  var opened = num("t"), at = num("at");
+  var REST = fut ? ["https://fapi.binance.com/fapi/v1/klines"]
+                 : ["https://api.binance.com/api/v3/klines", "https://data-api.binance.vision/api/v3/klines"];
+  var WS = fut ? ["wss://fstream.binance.com/market/ws/"]
+               : ["wss://stream.binance.com:9443/ws/", "wss://data-stream.binance.vision/ws/"];
+  var TZ = -new Date().getTimezoneOffset() * 60;   // the chart library shows UTC: shift to the phone's time
+  var $ = function (id) { return document.getElementById(id); };
+
+  // ---- Telegram: colours and full height (the page works the same in a normal browser)
+  var tg = null;
+  function applyTheme() {
+    var dark = window.matchMedia && matchMedia("(prefers-color-scheme: dark)").matches;
+    if (tg && tg.colorScheme) dark = tg.colorScheme === "dark";
+    document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
+    return dark;
+  }
+  var dark = applyTheme();
+  function css(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+
+  // ---- header and legend
+  var base = sym.replace(/USDT$/, "");
+  $("title").textContent = base + (fut ? " 무기한" : " 현물");
+  var kind = $("kind");
+  if (fut && side) { kind.textContent = side === "L" ? "롱 보유" : "숏 보유"; kind.className = "tag " + (side === "L" ? "long" : "short"); }
+  else { kind.textContent = fut ? "선물" : "현물 보유"; }
+  if (at && fut && side) {
+    var d = new Date(at * 1000);
+    $("note").textContent = "선 위치: " + (d.getMonth() + 1) + "/" + d.getDate() + " " + pad(d.getHours()) + ":" +
+      pad(d.getMinutes()) + " 기준 · 주문 기능 없음";
+  } else { $("note").textContent = "주문 기능 없음"; }
+  function pad(n) { return (n < 10 ? "0" : "") + n; }
+
+  var decimals = 2;
+  function fmt(x) {
+    if (x == null || !isFinite(x)) return "-";
+    return x.toLocaleString("en-US", { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
+  }
+  function pct(a, b) { return (a / b - 1) * 100; }
+  function decimalsOf(rows) {  // fewest decimals that keep every price (spot pads with zeros to 8)
+    var best = 0;
+    for (var i = Math.max(0, rows.length - 200); i < rows.length; i++) {
+      for (var k = 1; k <= 4; k++) {
+        var s = String(rows[i][k]); var dot = s.indexOf(".");
+        if (dot < 0) continue;
+        var frac = s.slice(dot + 1).replace(/0+$/, "");
+        if (frac.length > best) best = frac.length;
+      }
+    }
+    return Math.min(Math.max(best, 0), 8);
+  }
+
+  // ---- chart
+  var LW = window.LightweightCharts;
+  var chart, candles, volume, lines = [];
+  function colors() {
+    return {
+      layout: { background: { type: "solid", color: css("--bg") }, textColor: css("--muted"), fontSize: 11 },
+      grid: { vertLines: { color: css("--line") }, horzLines: { color: css("--line") } },
+      rightPriceScale: { borderColor: css("--line") },
+      timeScale: { borderColor: css("--line"), timeVisible: true, secondsVisible: false, rightOffset: 6 }
+    };
+  }
+  function build() {
+    var o = colors();
+    o.autoSize = true;
+    o.crosshair = { mode: 0 };
+    o.localization = { locale: "ko-KR" };
+    chart = LW.createChart($("chart"), o);
+    candles = chart.addCandlestickSeries({
+      upColor: css("--up"), downColor: css("--down"), borderVisible: false,
+      wickUpColor: css("--up"), wickDownColor: css("--down")
+    });
+    candles.applyOptions({ autoscaleInfoProvider: function (orig) {  // keep the entry and the stop in view
+      var r = orig();
+      if (!r || !r.priceRange || !fitLines || !fut || !side) return r;
+      [entry, stop].forEach(function (p) {
+        if (!p) return;
+        r.priceRange.minValue = Math.min(r.priceRange.minValue, p);
+        r.priceRange.maxValue = Math.max(r.priceRange.maxValue, p);
+      });
+      return r;
+    } });
+    volume = chart.addHistogramSeries({ priceFormat: { type: "volume" }, priceScaleId: "", lastValueVisible: false,
+                                        priceLineVisible: false });
+    volume.priceScale().applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+    candles.priceScale().applyOptions({ scaleMargins: { top: 0.08, bottom: 0.22 } });
+    chart.timeScale().subscribeVisibleLogicalRangeChange(function (r) {
+      if (ready && r && r.from < 15) older();
+    });
+  }
+  function recolor() {  // Telegram told us its theme after the chart was drawn
+    if (!chart) return;
+    chart.applyOptions(colors());
+    if (rows.length) volume.setData(rows.map(function (k) { return bar(k).v; }));
+    drawLines();
+  }
+  function initTelegram() {
+    var w = window.Telegram && window.Telegram.WebApp;
+    if (!w || tg) return;
+    tg = w;
+    try { tg.ready(); tg.expand(); } catch (e) { /* older Telegram */ }
+    var d = applyTheme();
+    if (d !== dark) { dark = d; recolor(); }
+    try {
+      tg.setHeaderColor(dark ? "#0b0e11" : "#ffffff");
+      tg.setBackgroundColor(dark ? "#0b0e11" : "#ffffff");
+      tg.onEvent("themeChanged", function () { dark = applyTheme(); recolor(); });
+    } catch (e) { /* not supported by this Telegram version */ }
+  }
+
+  function drawLines() {
+    lines.forEach(function (l) { candles.removePriceLine(l); });
+    lines = [];
+    var leg = $("legend"); leg.textContent = "";
+    function add(price, color, title, style, text) {
+      if (!price) return;
+      lines.push(candles.createPriceLine({ price: price, color: color, lineWidth: 1, lineStyle: style,
+                                           axisLabelVisible: true, title: title }));
+      var s = document.createElement("span"); var i = document.createElement("i");
+      i.style.background = color; s.appendChild(i); s.appendChild(document.createTextNode(text)); leg.appendChild(s);
+    }
+    if (!fut || !side) { leg.style.display = "none"; return; }
+    var sign = side === "L" ? 1 : -1;
+    var protect = entry && stop && (stop - entry) * sign >= 0;  // the stop is past the entry: profit is locked
+    add(entry, css("--entry"), "진입", 2, "평균 진입 " + fmt(entry));
+    if (stop) {
+      var p = entry ? " (" + (pct(stop, entry) >= 0 ? "+" : "") + pct(stop, entry).toFixed(2) + "%)" : "";
+      add(stop, css(protect ? "--protect" : "--stop"), protect ? "이익보호" : "손절", 0,
+          (protect ? "이익 보호 손절 " : "손절 ") + fmt(stop) + p);
+    }
+    if (initStop && stop && Math.abs(initStop - stop) > 1e-12) add(initStop, css("--muted"), "처음 손절", 3, "처음 손절 " + fmt(initStop));
+    add(liq, css("--liq"), "청산", 1, "청산가(추정) " + fmt(liq));
+  }
+
+  function bar(k) {  // kline row -> chart bar (time shifted to the phone's clock)
+    var t = Math.floor(k[0] / 1000) + TZ;
+    var o = +k[1], c = +k[4];
+    return { c: { time: t, open: o, high: +k[2], low: +k[3], close: c },
+             v: { time: t, value: +k[5], color: c >= o ? css("--up") + "66" : css("--down") + "66" } };
+  }
+
+  var fitLines = true;
+  try { fitLines = localStorage.getItem("th_fit") !== "0"; } catch (e) { /* default: on */ }
+  var tf = pick(), rows = [], seq = 0, loadingOld = false, noMore = false, lastPrice = null, ready = false;
+  function pick() {
+    var want = q.get("tf");
+    try { want = localStorage.getItem("th_tf") || want; } catch (e) { /* storage blocked: default */ }
+    return TF.some(function (x) { return x[0] === want; }) ? want : "15m";
+  }
+  function tfSec(k) { for (var i = 0; i < TF.length; i++) if (TF[i][0] === k) return TF[i][2]; return 900; }
+
+  function fetchRows(params) {
+    var i = 0;
+    function attempt() {
+      var url = REST[i] + "?" + new URLSearchParams(params).toString();
+      return fetch(url, { cache: "no-store" }).then(function (r) {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+      }).catch(function (e) {
+        if (++i < REST.length) return attempt();
+        throw e;
+      });
+    }
+    return attempt();
+  }
+
+  function message(text) {
+    $("msgText").textContent = text || "";
+    $("msg").style.display = text ? "flex" : "none";
+  }
+
+  function load() {
+    var my = ++seq;
+    noMore = false;
+    ready = false;
+    message("");
+    $("live").textContent = "불러오는 중"; $("live").className = "";
+    stopLive();
+    return fetchRows({ symbol: sym, interval: tf, limit: 1000 }).then(function (data) {
+      if (my !== seq) return;
+      if (!Array.isArray(data) || !data.length) throw new Error("빈 응답");
+      rows = data;
+      decimals = decimalsOf(rows);
+      candles.applyOptions({ priceFormat: { type: "price", precision: decimals, minMove: Math.pow(10, -decimals) } });
+      var b = rows.map(bar);
+      candles.setData(b.map(function (x) { return x.c; }));
+      volume.setData(b.map(function (x) { return x.v; }));
+      markEntry();
+      drawLines();
+      chart.timeScale().setVisibleLogicalRange({ from: Math.max(0, rows.length - visibleBars()), to: rows.length + 5 });
+      ready = true;
+      ticker(+rows[rows.length - 1][4]);
+      startLive(my);
+    }).catch(function () {
+      if (my !== seq) return;
+      message("바이낸스 시세를 불러오지 못했습니다. 인터넷 연결을 확인하고 다시 시도해 주세요.");
+      $("live").textContent = "연결 안 됨";
+    });
+  }
+  function visibleBars() { return Math.max(40, Math.min(140, Math.round(window.innerWidth / 6))); }
+
+  function older() {  // scrolled to the left edge: fetch the candles before the first one
+    if (loadingOld || noMore || !rows.length) return;
+    loadingOld = true;
+    var my = seq;
+    fetchRows({ symbol: sym, interval: tf, limit: 1000, endTime: rows[0][0] - 1 }).then(function (data) {
+      if (my !== seq) return;
+      var first = rows[0][0];
+      data = Array.isArray(data) ? data.filter(function (k) { return k[0] < first; }) : [];
+      if (!data.length) { noMore = true; return; }
+      var range = chart.timeScale().getVisibleLogicalRange();
+      rows = data.concat(rows);
+      var b = rows.map(bar);
+      candles.setData(b.map(function (x) { return x.c; }));
+      volume.setData(b.map(function (x) { return x.v; }));
+      markEntry();
+      if (range) chart.timeScale().setVisibleLogicalRange({ from: range.from + data.length, to: range.to + data.length });
+    }).catch(function () { /* keep what is shown */ }).then(function () { loadingOld = false; });
+  }
+
+  function markEntry() {
+    if (!fut || !side || !opened || !rows.length) { candles.setMarkers([]); return; }
+    var s = tfSec(tf), t = Math.floor(opened / s) * s;  // Binance candles start on whole UTC intervals
+    if (t * 1000 < rows[0][0]) { candles.setMarkers([]); return; }
+    candles.setMarkers([{ time: t + TZ, position: side === "L" ? "belowBar" : "aboveBar",
+                          color: css("--entry"), shape: side === "L" ? "arrowUp" : "arrowDown", text: "진입" }]);
+  }
+
+  function ticker(p) {
+    lastPrice = p;
+    $("price").textContent = fmt(p);
+    var chg = $("chg");
+    if (fut && side && entry) {
+      var r = pct(p, entry) * (side === "L" ? 1 : -1);
+      chg.textContent = "진입 대비 " + (r >= 0 ? "+" : "") + r.toFixed(2) + "%";
+      chg.className = r >= 0 ? "up" : "down";
+    } else if (rows.length) {
+      var day = 86400000, last = rows[rows.length - 1][0], ref = null;
+      for (var i = rows.length - 1; i >= 0; i--) { if (rows[i][0] <= last - day + 1) { ref = +rows[i][4]; break; } }
+      if (ref) { var c = pct(p, ref); chg.textContent = "24시간 " + (c >= 0 ? "+" : "") + c.toFixed(2) + "%"; chg.className = c >= 0 ? "up" : "down"; }
+      else chg.textContent = "";
+    }
+  }
+
+  function onKline(k) {  // k: [open time, o, h, l, c, v]
+    if (!rows.length) return;
+    var last = rows[rows.length - 1];
+    if (k[0] < last[0]) return;
+    if (k[0] === last[0]) rows[rows.length - 1] = k; else rows.push(k);
+    var b = bar(k);
+    candles.update(b.c); volume.update(b.v);
+    ticker(+k[4]);
+  }
+
+  // ---- live: WebSocket, else ask the REST API every few seconds
+  var ws = null, poll = null, wsTry = 0;
+  function stopLive() {
+    if (ws) { ws.onclose = ws.onerror = ws.onmessage = null; try { ws.close(); } catch (e) { /* closed */ } ws = null; }
+    if (poll) { clearInterval(poll); poll = null; }
+  }
+  function startLive(my) {
+    if (!("WebSocket" in window) || wsTry >= WS.length * 2) return startPoll(my);
+    var url = WS[wsTry % WS.length] + sym.toLowerCase() + "@kline_" + tf;
+    var isOpen = false, sock;
+    try { sock = new WebSocket(url); } catch (e) { wsTry++; return startLive(my); }
+    ws = sock;
+    var guard = setTimeout(function () { if (!isOpen && ws === sock) { sock.close(); } }, 6000);
+    sock.onopen = function () { isOpen = true; clearTimeout(guard); live(true, "실시간"); };
+    sock.onmessage = function (ev) {
+      if (my !== seq) return;
+      try {
+        var m = JSON.parse(ev.data), k = m.k || (m.data && m.data.k);
+        if (k) onKline([k.t, k.o, k.h, k.l, k.c, k.v]);
+      } catch (e) { /* ignore a bad frame */ }
+    };
+    sock.onerror = function () { /* onclose follows */ };
+    sock.onclose = function () {
+      clearTimeout(guard);
+      if (ws !== sock || my !== seq) return;
+      ws = null;
+      if (!isOpen) wsTry++;
+      live(false, "다시 연결 중");
+      setTimeout(function () { if (my === seq && !ws && !poll) startLive(my); }, isOpen ? 1000 : 300);
+    };
+  }
+  function startPoll(my) {
+    live(true, "3초마다 갱신");
+    poll = setInterval(function () {
+      if (my !== seq || document.hidden) return;
+      fetchRows({ symbol: sym, interval: tf, limit: 2 }).then(function (data) {
+        if (my !== seq || !Array.isArray(data)) return;
+        data.forEach(function (k) { onKline([k[0], k[1], k[2], k[3], k[4], k[5]]); });
+      }).catch(function () { live(false, "갱신 실패 — 재시도 중"); });
+    }, 3000);
+  }
+  function live(on, text) { var el = $("live"); el.textContent = text; el.className = on ? "on" : ""; }
+
+  // ---- timeframe buttons
+  TF.forEach(function (x) {
+    var b = document.createElement("button");
+    b.type = "button"; b.textContent = x[1]; b.dataset.tf = x[0];
+    b.setAttribute("aria-pressed", String(x[0] === tf));
+    b.addEventListener("click", function () {
+      if (tf === x[0]) return;
+      tf = x[0];
+      try { localStorage.setItem("th_tf", tf); } catch (e) { /* not remembered */ }
+      Array.prototype.forEach.call($("tfs").children, function (c) { c.setAttribute("aria-pressed", String(c.dataset.tf === tf)); });
+      wsTry = 0;
+      load();
+    });
+    $("tfs").appendChild(b);
+  });
+  if (fut && side && (entry || stop)) {
+    var fb = document.createElement("button");
+    fb.type = "button"; fb.textContent = "선 맞춤"; fb.title = "진입가·손절가가 화면에 들어오게 맞춤";
+    fb.setAttribute("aria-pressed", String(fitLines));
+    fb.addEventListener("click", function () {
+      fitLines = !fitLines;
+      fb.setAttribute("aria-pressed", String(fitLines));
+      try { localStorage.setItem("th_fit", fitLines ? "1" : "0"); } catch (e) { /* not remembered */ }
+      chart.priceScale("right").applyOptions({ autoScale: true });
+    });
+    fb.style.marginLeft = "auto";
+    $("tfs").appendChild(fb);
+  }
+  $("retry").addEventListener("click", function () { wsTry = 0; load(); });
+  document.addEventListener("visibilitychange", function () {
+    if (!document.hidden && rows.length && !ws && !poll) { wsTry = 0; load(); }
+  });
+
+  if (!LW) { message("차트 도구를 불러오지 못했습니다. 다시 열어 주세요."); return; }
+  build();
+  window.__thTg = initTelegram;
+  initTelegram();
+  window.__th = { sym: sym, fut: fut, tf: function () { return tf; }, rows: function () { return rows.length; },
+                  lines: function () { return lines.length; }, price: function () { return lastPrice; },
+                  live: function () { return $("live").textContent; } };
+  load();
+})();
+</script>
+</body>
+</html>

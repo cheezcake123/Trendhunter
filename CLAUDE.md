@@ -28,4 +28,8 @@
 - 전략·위험 규칙을 바꿀 때는 실제 데이터로 검증한다: `research/lab.py`(사용법은 파일 머리말). 바이낸스 API가 막힌 환경에서도 돌아간다. `research/`는 zip에 넣지 않는다.
   - 현물 쪽은 공개 저장소 `finom/static-klines`의 현물 캔들, 선물 쪽은 반드시 `--futures-data`(이 저장소 `research/futures-data` 브랜치의 선물 캔들 + 실제 펀딩비)로 본다. 현물 캔들로 선물을 계산하면 결과가 크게 부풀 수 있다(2026-11 확인). 데이터가 오래됐으면 그 브랜치의 GitHub Actions(`Fetch futures research data`)를 다시 돌린다.
   - 비교는 전체 기간 하나로 끝내지 말고 2020~23 / 2024~ 두 구간, 주변 값, 종목 하나씩 빼기까지 본다. 규칙은 `strategy.py`·`risk.py`에 두어 실전과 백테스트가 같은 코드를 쓰게 한다.
+- `docs/`는 GitHub Pages(main 브랜치 `/docs`)로 올라가는 텔레그램 미니앱 페이지다. 지금은 `/chart` 차트 페이지(`docs/chart.html`) 하나이고 zip에 넣지 않는다.
+  - 보기 전용이다: 키·주문·계정 정보를 받지 않고 바이낸스 공개 시세만 읽는다. 봇이 버튼 링크에 넣는 값은 가격과 시각뿐이다(수량 없음).
+  - 외부 CDN 대신 `docs/vendor/`의 파일을 쓴다(라이선스 파일 함께). 바꿀 때는 GitHub Actions로 npm에서 받아 온다(이 환경에서는 npm·CDN이 막혀 있음).
+  - 페이지를 고치면 `python3 tools/check_chart_page.py docs`(Playwright 필요)로 점검한다.
 - 줄바꿈은 LF만 쓴다(`.gitattributes`로 고정). CRLF가 섞인 `install.sh`·`th`는 서버에서 실행되지 않는다.

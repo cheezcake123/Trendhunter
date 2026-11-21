@@ -61,6 +61,7 @@ def make_trader(fake, clock, tmp, mode="live", over=None, spot=False):
     cfg["symbols"] = list(fake.symbols)
     cfg["spot_enabled"] = spot
     cfg["spot_candidates"] = list(fake.symbols)
+    cfg["cool_off_hours"] = 0.0  # settings apply at once in these tests; the 24 h wait has its own (test_cooloff)
     cfg.update(over or {})
     tg = FakeTG()
     tr = B.Trader(cfg, store, make_api(fake, clock), tg, LOG, clock=clock, sleep=lambda s: None,
